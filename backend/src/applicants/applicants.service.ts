@@ -3,10 +3,11 @@ import { pool } from '../database';
 const pdfParse = require('pdf-parse');
 import * as mammoth from 'mammoth';
 import * as jwt from 'jsonwebtoken';
-import { sendPasswordResetEmail } from '../utils/mailer';
-import { uploadToAzure, uploadToReclassAzure } from '../utils/azureStorage';
+import { uploadToReclassAzure } from '../utils/azureStorage';
 import { compressPdf } from '../utils/pdfCompressor';
-import { withDeadlockRetry } from '../utils/pgRetry';
+import { DocumentsService } from '../features/documents/documents.service';
+import { ApplicationsService } from '../features/applications/applications.service';
+import { ApplicantProfileService } from '../features/applicant-profile/applicant-profile.service';
 
 /**
  * reclass_gc no longer stores first_name, last_name, region, division or
@@ -26,12 +27,6 @@ const RECLASS_GC_FULL = `(
   LEFT JOIN gmis_gc_items gi ON gi.id = rg.gmis_id
   LEFT JOIN ref.initial_reclass ir ON ir.psi_cd = rg.item_no
 )`;
-
-/** Strict whitelist of applications columns that document replacement may write. */
-const APPLICATION_DOC_COLUMNS = {
-  'Letter of Intent': 'letter_of_intent',
-  'Sworn Declaration': 'sworn_document',
-} as const;
 
 export interface ReclassRegisterDto {
   item_number?: string;
@@ -54,150 +49,6 @@ export interface ReclassRegisterDto {
   years_experience?: number | string;
   hours_of_training?: number | string;
   eligibility?: string;
-}
-
-function parseAndSanitizeDate(dateInput: any): Date | null {
-  if (!dateInput) return null;
-  if (dateInput instanceof Date && !isNaN(dateInput.getTime()))
-    return dateInput;
-  if (typeof dateInput !== 'string') return null;
-
-  let str = dateInput.trim();
-  if (!str || str.toLowerCase() === 'n/a') return null;
-
-  // Auto-correct 3-digit years like "198-11-20" -> "1998-11-20"
-  if (/^\d{3}-\d{2}-\d{2}/.test(str)) {
-    str = '19' + str;
-  }
-  // Auto-correct leading-zero year typos like "0217-07-03" -> "2017-07-03"
-  if (/^021(\d-\d{2}-\d{2})/.test(str)) {
-    str = str.replace(/^021/, '201');
-  } else if (/^019(\d-\d{2}-\d{2})/.test(str)) {
-    str = str.replace(/^019/, '199');
-  } else if (/^020(\d-\d{2}-\d{2})/.test(str)) {
-    str = str.replace(/^020/, '200');
-  }
-
-  const d = new Date(str);
-  if (isNaN(d.getTime())) return null;
-  if (d.getFullYear() < 1900 || d.getFullYear() > new Date().getFullYear() + 1)
-    return null;
-  return d;
-}
-
-function calculateExperience(workExpList: any[]): number {
-  if (!Array.isArray(workExpList)) return 0;
-  let totalDays = 0;
-  for (const exp of workExpList) {
-    const fromRaw = exp.from || exp.fromDate || exp.date_from;
-    const toRaw = exp.to || exp.toDate || exp.date_to;
-    if (fromRaw && toRaw) {
-      let from = parseAndSanitizeDate(fromRaw);
-      let to: Date | null = null;
-      if (
-        typeof toRaw === 'string' &&
-        toRaw.trim().toLowerCase() === 'present'
-      ) {
-        to = new Date();
-      } else {
-        to = parseAndSanitizeDate(toRaw);
-      }
-      if (from && to) {
-        // Handle reversed start/end dates gracefully
-        if (from > to) {
-          const temp = from;
-          from = to;
-          to = temp;
-        }
-        const now = new Date();
-        const effectiveTo = to > now ? now : to;
-        const diffTime = Math.abs(effectiveTo.getTime() - from.getTime());
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-        totalDays += diffDays;
-      }
-    }
-  }
-  return Number((totalDays / 365).toFixed(2));
-}
-
-function calculateTraining(learningList: any[]): number {
-  if (!Array.isArray(learningList)) return 0;
-  let totalHours = 0;
-  for (const ld of learningList) {
-    const fromRaw = ld.from || ld.fromDate || ld.date_from;
-    const toRaw = ld.to || ld.toDate || ld.date_to;
-
-    let maxHoursForEntry: number | null = null;
-
-    if (fromRaw && toRaw) {
-      let from = parseAndSanitizeDate(fromRaw);
-      let to = parseAndSanitizeDate(toRaw);
-      if (from && to) {
-        if (from > to) {
-          const temp = from;
-          from = to;
-          to = temp;
-        }
-        const diffTime = Math.abs(to.getTime() - from.getTime());
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-        maxHoursForEntry = diffDays * 8;
-      }
-    }
-
-    let hrs = 0;
-    if (ld.hours && ld.hours !== 'N/A') {
-      const parsed = Number(ld.hours);
-      if (!isNaN(parsed) && parsed > 0 && parsed < 100000) {
-        hrs = parsed;
-      }
-    }
-
-    if (hrs === 0 && maxHoursForEntry !== null) {
-      hrs = maxHoursForEntry;
-    }
-
-    if (maxHoursForEntry !== null) {
-      hrs = Math.min(hrs, maxHoursForEntry);
-    }
-
-    totalHours += hrs;
-  }
-  return totalHours;
-}
-
-function extractBachelorsDegree(educationalList: any[]): string | null {
-  if (!Array.isArray(educationalList)) return null;
-  for (const ed of educationalList) {
-    if (
-      ed.level &&
-      (ed.level.toLowerCase() === 'college' ||
-        ed.level.toLowerCase() === 'bachelor')
-    ) {
-      return ed.degree || ed.course || ed.basic_education_degree || null;
-    }
-  }
-  return null;
-}
-
-function extractEligibility(eligibilityList: any[]): string | null {
-  if (!Array.isArray(eligibilityList)) return null;
-  const eligibilities = eligibilityList
-    .map((e) => e.eligibility || e.career_service || e.title)
-    .filter(Boolean);
-  return eligibilities.length > 0 ? eligibilities.join(', ') : null;
-}
-
-function calculateAge(dob: string | Date | null): number | null {
-  if (!dob) return null;
-  const birthDate = new Date(dob);
-  if (isNaN(birthDate.getTime())) return null;
-  const today = new Date();
-  let age = today.getFullYear() - birthDate.getFullYear();
-  const m = today.getMonth() - birthDate.getMonth();
-  if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
-    age--;
-  }
-  return age;
 }
 
 class ApplicantsServiceClass {
@@ -341,26 +192,12 @@ class ApplicantsServiceClass {
 
   async findByEmail(email_address: string) {
     const result = await pool.query(
-      'SELECT * FROM applicants WHERE LOWER(TRIM(email_address)) = LOWER(TRIM($1)) LIMIT 1',
+      `SELECT id, applicant_number, email_address, first_name, middle_name, surname,
+              registrant_type, plantilla_item_number
+       FROM applicants WHERE LOWER(TRIM(email_address)) = LOWER(TRIM($1)) LIMIT 1`,
       [email_address],
     );
     return result.rows[0];
-  }
-
-  async findAll() {
-    const result = await pool.query(`
-      SELECT a.*, 
-             COALESCE(
-               json_agg(j.*) FILTER (WHERE j.id IS NOT NULL), 
-               '[]'
-             ) as job_applications
-      FROM applicants a
-      LEFT JOIN applications j ON a.id::text = j.applicant_id
-      WHERE EXISTS (SELECT 1 FROM applications WHERE applicant_id = a.id::text)
-      GROUP BY a.id
-      ORDER BY a.id DESC
-    `);
-    return result.rows;
   }
 
   async login(
@@ -433,1313 +270,87 @@ class ApplicantsServiceClass {
     return applicant;
   }
 
-  async applyJob(applicantId: number, jobTitle: string, jobClusterId?: string) {
-    if (
-      !jobClusterId ||
-      jobClusterId === 'null' ||
-      jobClusterId === 'undefined' ||
-      String(jobClusterId).trim() === ''
-    ) {
-      throw new Error('Invalid job cluster ID provided.');
-    }
-
-    const applicantRes = await pool.query(
-      'SELECT applicant_number, other_information FROM applicants WHERE id = $1',
-      [applicantId],
-    );
-    const applicantRow = applicantRes.rows[0];
-    const applicantNumber = applicantRow?.applicant_number || null;
-
-    let otherInfo = applicantRow?.other_information || {};
-    if (typeof otherInfo === 'string') {
-      try {
-        otherInfo = JSON.parse(otherInfo);
-      } catch (e) { }
-    }
-    const letterOfIntent = otherInfo?.documents?.['Letter of Intent'] || null;
-    const swornDocument = otherInfo?.documents?.['Sworn Declaration'] || null;
-
-    console.log(
-      `[DEBUG] applyJob started for applicantId=${applicantId}, jobClusterId=${jobClusterId}`,
-    );
-
-    const checkResult = await pool.query(
-      'SELECT * FROM applications WHERE applicant_id = $1 AND job_cluster_id = $2',
-      [applicantId.toString(), jobClusterId],
-    );
-    const hasActiveApp = checkResult.rows.some((row: any) => {
-      const appStatus = String(row.application_status || '').trim().toUpperCase();
-      const status = String(row.status || '').trim().toUpperCase();
-      const isExcludedOrDisqualified =
-        appStatus === 'EXCLUDED' ||
-        appStatus === 'DISQUALIFIED' ||
-        status === 'EXCLUDED' ||
-        status === 'DISQUALIFIED';
-      return !isExcludedOrDisqualified;
-    });
-    if (hasActiveApp) {
-      throw new Error('You have already applied for this job cluster.');
-    }
-
-    const appId = require('crypto').randomUUID();
-    console.log(`[DEBUG] applyJob generated appId=${appId}`);
-
-    // Generate application_number in format YYYYMMDD-00001
-    const today = new Date();
-    // Use local timezone format if possible, but safely using UTC or basic padStart
-    const yyyy = today.getFullYear();
-    const mm = String(today.getMonth() + 1).padStart(2, '0');
-    const dd = String(today.getDate()).padStart(2, '0');
-    const dateStr = `${yyyy}${mm}${dd}`;
-
-    const lastApp = await pool.query(
-      `
-      SELECT application_number FROM applications 
-      WHERE application_number LIKE $1 
-      ORDER BY application_number DESC LIMIT 1
-    `,
-      [`${dateStr}-%`],
-    );
-
-    let nextAppNum = 1;
-    if (lastApp.rows.length > 0 && lastApp.rows[0].application_number) {
-      const match = lastApp.rows[0].application_number.split('-');
-      if (match.length > 1) {
-        nextAppNum = parseInt(match[1], 10) + 1;
-      }
-    }
-    const uniqueApplicationNumber = `${dateStr}-${String(nextAppNum).padStart(5, '0')}`;
-
-    console.log(`[DEBUG] applyJob executing INSERT with args:`, [
-      appId,
-      uniqueApplicationNumber,
-      applicantId.toString(),
-      jobClusterId || null,
-      letterOfIntent,
-      swornDocument,
-    ]);
-
-    try {
-      const result = await pool.query(
-        `
-        INSERT INTO applications (id, application_number, applicant_id, job_cluster_id, status, date_applied, created_at, letter_of_intent, sworn_document)
-        VALUES ($1, $2, $3, $4, 'Pending', NOW(), NOW(), $5, $6)
-        RETURNING *
-      `,
-        [
-          appId,
-          uniqueApplicationNumber,
-          applicantId.toString(),
-          jobClusterId || null,
-          letterOfIntent,
-          swornDocument,
-        ],
-      );
-
-      // Log ALL uploaded documents into document_audit_logs simultaneously in a single batch insert
-      const allDocs: Record<string, string> = {};
-      if (otherInfo.documents && typeof otherInfo.documents === 'object') {
-        for (const [key, val] of Object.entries(otherInfo.documents)) {
-          const normKey =
-            key === 'Personal Data Sheet'
-              ? 'Notarized Personal Data Sheet'
-              : key;
-          allDocs[normKey] = val as string;
-        }
-      }
-      if (letterOfIntent) {
-        allDocs['Letter of Intent'] = letterOfIntent;
-      }
-      if (swornDocument) {
-        allDocs['Sworn Declaration'] = swornDocument;
-      }
-      if (
-        otherInfo.photoUrl &&
-        !allDocs['Profile Photo'] &&
-        !allDocs['profile_photo']
-      ) {
-        allDocs['Profile Photo'] = otherInfo.photoUrl;
-      }
-
-      const batchNumber = await this.getNextBatchNumber(applicantId);
-      const applyAuditRecords = Object.entries(allDocs)
-        .filter(
-          ([_, docUrl]) =>
-            typeof docUrl === 'string' && docUrl.trim().length > 0,
-        )
-        .map(([docName, docUrl]) => ({
-          applicantId,
-          docType: docName,
-          newBlobUrl: docUrl,
-          affectedCount: 1,
-          applicationId: appId,
-          isOpen: true,
-          batchNumber,
-        }));
-
-      if (applyAuditRecords.length > 0) {
-        await this.batchLogDocumentAuditRecords(applyAuditRecords);
-      }
-
-      // If applicant was invited for this job cluster, mark is_submitted = true in agap_invited
-      try {
-        const appRes = await pool.query(
-          'SELECT email_address, alternate_email FROM applicants WHERE id = $1',
-          [applicantId],
-        );
-        if (appRes.rows.length > 0 && jobClusterId) {
-          const emails = [
-            appRes.rows[0].email_address,
-            appRes.rows[0].alternate_email,
-          ]
-            .filter(Boolean)
-            .map((e: string) => e.trim().toLowerCase());
-          if (emails.length > 0) {
-            await pool.query(
-              `UPDATE agap_invited 
-               SET is_submitted = true, updated_at = NOW() 
-               WHERE (job_cluster_id = $1 OR job_cluster_id::text = $1::text) 
-                 AND LOWER(TRIM(email)) = ANY($2::text[])`,
-              [jobClusterId, emails],
-            );
-          }
-        }
-      } catch (invErr) {
-        console.warn(
-          'Could not update agap_invited is_submitted status:',
-          invErr,
-        );
-      }
-
-      console.log(
-        `[DEBUG] applyJob INSERT successful. Returning row:`,
-        result.rows[0],
-      );
-      return result.rows[0];
-    } catch (dbError) {
-      console.error(`[DEBUG] applyJob INSERT failed:`, dbError);
-      throw dbError;
-    }
+  // Application methods live in features/applications/applications.service.ts; delegates keep callers unchanged.
+  applyJob(...args: Parameters<typeof ApplicationsService.applyJob>) {
+    return ApplicationsService.applyJob(...args);
   }
 
-  async findApplications(applicantId: number) {
-    const result = await pool.query(
-      `
-      SELECT a.*, p.title as job_title, c.region as region, c.division as division, qe.overall_fit,
-             (SELECT v.status FROM vacancies v WHERE v.job_cluster_id = c.id LIMIT 1) as vacancy_status,
-             (SELECT MIN(v.posting_start) FROM vacancies v WHERE v.job_cluster_id = c.id) as posting_start,
-             (SELECT MAX(v.posting_end) FROM vacancies v WHERE v.job_cluster_id = c.id) as posting_end,
-             (SELECT v.item_no FROM vacancies v WHERE v.job_cluster_id = c.id LIMIT 1) as item_no,
-             p.salary_grade as salary_grade,
-             (EXISTS (
-               SELECT 1 FROM agap_invited ai 
-               JOIN applicants app ON LOWER(TRIM(ai.email)) IN (
-                 LOWER(TRIM(COALESCE(app.email_address, ''))), 
-                 LOWER(TRIM(COALESCE(app.alternate_email, ''))),
-                 LOWER(TRIM(COALESCE(app.email, '')))
-               )
-               WHERE app.id = $1 AND (ai.job_cluster_id IS NULL OR ai.job_cluster_id::text = c.id::text OR REPLACE(ai.job_cluster_id::text, '-', '') = REPLACE(c.id::text, '-', ''))
-                 AND (ai.is_revoked IS NOT TRUE)
-             )) as is_invited
-      FROM applications a
-      LEFT JOIN job_clusters c ON a.job_cluster_id::text = c.id::text
-      LEFT JOIN positions p ON c.position_id = p.id
-      LEFT JOIN (
-        SELECT application_id, MAX(overall_fit) as overall_fit
-        FROM qual_evals
-        GROUP BY application_id
-      ) qe ON a.id = qe.application_id
-      WHERE a.applicant_id = $1
-    `,
-      [applicantId.toString()],
-    );
-    return result.rows.map((r) => ({
-      ...r,
-      position_id: r.job_cluster_id,
-      application_status: r.application_status || r.status,
-      is_invited: Boolean(r.is_invited),
-      isInvited: Boolean(r.is_invited),
-    }));
+  findApplications(...args: Parameters<typeof ApplicationsService.findApplications>) {
+    return ApplicationsService.findApplications(...args);
   }
 
-  async toggleSavedJob(applicantId: number, jobClusterId: string) {
-    const checkResult = await pool.query(
-      'SELECT * FROM saved_clusters WHERE applicant_id = $1 AND job_cluster_id = $2',
-      [applicantId, jobClusterId],
-    );
-    const existing = checkResult.rows[0];
-
-    if (existing) {
-      const newStatus = !existing.is_saved;
-      await pool.query(
-        'UPDATE saved_clusters SET is_saved = $1 WHERE id = $2',
-        [newStatus, existing.id],
-      );
-      return { status: newStatus ? 'added' : 'removed' };
-    } else {
-      await pool.query(
-        `
-        INSERT INTO saved_clusters (applicant_id, job_cluster_id, is_saved)
-        VALUES ($1, $2, true)
-      `,
-        [applicantId, jobClusterId],
-      );
-      return { status: 'added' };
-    }
+  toggleSavedJob(...args: Parameters<typeof ApplicationsService.toggleSavedJob>) {
+    return ApplicationsService.toggleSavedJob(...args);
   }
 
-  async findSavedJobs(applicantId: number) {
-    const result = await pool.query(
-      `
-      SELECT job_cluster_id as position_id
-      FROM saved_clusters 
-      WHERE applicant_id = $1 AND is_saved = true
-    `,
-      [applicantId],
-    );
-    return result.rows;
+  findSavedJobs(...args: Parameters<typeof ApplicationsService.findSavedJobs>) {
+    return ApplicationsService.findSavedJobs(...args);
   }
 
-  async create(data: any) {
-    console.log(
-      '==== CREATE PAYLOAD ====\n',
-      JSON.stringify(data, null, 2),
-      '\n========================',
-    );
-    const rawEmail = (data.email_address || data.email || '').trim();
-    const email = rawEmail ? rawEmail.toLowerCase() : `no-email-${Date.now()}@test.com`;
 
-    if (rawEmail && !rawEmail.startsWith('no-email-')) {
-      const existing = await pool.query(
-        `SELECT id FROM applicants 
-         WHERE (LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1)) 
-            OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
-            OR LOWER(TRIM(COALESCE(alternate_email, ''))) = LOWER(TRIM($1)))
-         LIMIT 1`,
-        [rawEmail],
-      );
-      if (existing.rows.length > 0) {
-        const err: any = new Error(
-          'Email address is already registered. Please sign in instead.',
-        );
-        err.statusCode = 409;
-        throw err;
-      }
-    }
-
-    let passwordHash: string | null = null;
-    if (data.password) {
-      passwordHash = await bcrypt.hash(data.password, 10);
-    }
-
-    const questionnaire_responses = JSON.stringify(
-      data.questionnaire_responses || {},
-    );
-
-    // Generate AGAP-0001 format for applicant_number using transaction and latest ID
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query('LOCK TABLE applicants IN EXCLUSIVE MODE');
-
-      if (rawEmail && !rawEmail.startsWith('no-email-')) {
-        const existingInTx = await client.query(
-          `SELECT id FROM applicants 
-           WHERE (LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1)) 
-              OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
-              OR LOWER(TRIM(COALESCE(alternate_email, ''))) = LOWER(TRIM($1)))
-           LIMIT 1`,
-          [rawEmail],
-        );
-        if (existingInTx.rows.length > 0) {
-          const err: any = new Error(
-            'Email address is already registered. Please sign in instead.',
-          );
-          err.statusCode = 409;
-          throw err;
-        }
-      }
-
-      const lastApplicant = await client.query(
-        `SELECT applicant_number FROM public.applicants WHERE applicant_number LIKE 'AGAP-%' ORDER BY id DESC LIMIT 1`,
-      );
-      let nextApplicantNum = 1;
-      if (
-        lastApplicant.rows.length > 0 &&
-        lastApplicant.rows[0].applicant_number
-      ) {
-        const match =
-          lastApplicant.rows[0].applicant_number.match(/AGAP-(\d+)/);
-        if (match) {
-          nextApplicantNum = parseInt(match[1], 10) + 1;
-        }
-      }
-      const newApplicantNumber = `AGAP-${String(nextApplicantNum).padStart(4, '0')}`;
-
-      const result = await client.query(
-        `
-        INSERT INTO applicants (
-          applicant_number, password_hash, surname, first_name, middle_name, date_of_birth, place_of_birth,
-          sex, civil_status, citizenship, blood_type, gsis_id_no, pag_ibig_id_no, philhealth_no,
-          sss_no, residential_address, permanent_address, telephone_no, mobile_no, email_address,
-          educational_background, civil_service_eligibility, work_experience, voluntary_work,
-          learning_and_development, other_information, questionnaire_responses, family_background,
-          spouse_surname, spouse_first_name, spouse_middle_name, spouse_name_extension, spouse_occupation,
-          spouse_employer_business, spouse_business_address, spouse_telephone,
-          father_surname, father_first_name, father_middle_name, father_name_extension,
-          mother_maiden_surname, mother_first_name, mother_middle_name, children_details, alternate_email,
-          years_experience, training_hours, bachelors_degree, eligibility, age, religion, disability, ethnic_group, is_test
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-          , $13, $14, $15, $16, $17, $18, $19, $20,
-          $21, $22, $23, $24, $25, $26, $27, $28,
-          $29, $30, $31, $32, $33, $34, $35, $36,
-          $37, $38, $39, $40, $41, $42, $43, $44, $45,
-          $46, $47, $48, $49, $50, $51, $52, $53, $54
-        ) RETURNING *
-      `,
-        [
-          newApplicantNumber,
-          passwordHash,
-          data.surname || 'UNKNOWN',
-          data.first_name || 'UNKNOWN',
-          data.middle_name || null,
-          data.date_of_birth ? new Date(data.date_of_birth) : null,
-          data.place_of_birth || null,
-          data.sex || null,
-          data.civil_status || null,
-          data.citizenship || null,
-          data.blood_type || null,
-          data.gsis_id_no || null,
-          data.pag_ibig_id_no || null,
-          data.philhealth_no || null,
-          data.sss_no || null,
-          data.residential_address
-            ? JSON.stringify(data.residential_address)
-            : null,
-          data.permanent_address
-            ? JSON.stringify(data.permanent_address)
-            : null,
-          data.telephone_no || null,
-          data.mobile_no || null,
-          email,
-          JSON.stringify(data.educational_background || []),
-          JSON.stringify(data.civil_service_eligibility || []),
-          JSON.stringify(data.work_experience || []),
-          JSON.stringify(data.voluntary_work || []),
-          JSON.stringify(data.learning_and_development || []),
-          JSON.stringify(data.other_information || {}),
-          questionnaire_responses,
-          data.family_background
-            ? JSON.stringify(data.family_background)
-            : null,
-          data.family_background?.spouse?.surname || null,
-          data.family_background?.spouse?.first_name || null,
-          data.family_background?.spouse?.middle_name || null,
-          data.family_background?.spouse?.name_extension || null,
-          data.family_background?.spouse?.occupation || null,
-          data.family_background?.spouse?.employer_business_name || null,
-          data.family_background?.spouse?.business_address || null,
-          data.family_background?.spouse?.telephone_no || null,
-          data.family_background?.father?.surname || null,
-          data.family_background?.father?.first_name || null,
-          data.family_background?.father?.middle_name || null,
-          data.family_background?.father?.name_extension || null,
-          data.family_background?.mother?.maiden_surname || null,
-          data.family_background?.mother?.first_name || null,
-          data.family_background?.mother?.middle_name || null,
-          data.family_background?.children
-            ? JSON.stringify(data.family_background.children)
-            : null,
-          data.alternate_email || null,
-          calculateExperience(data.work_experience || []),
-          calculateTraining(data.learning_and_development || []),
-          extractBachelorsDegree(data.educational_background || []),
-          extractEligibility(data.civil_service_eligibility || []),
-          calculateAge(data.date_of_birth),
-          data.religion || null,
-          data.disability || null,
-          data.ethnic_group || null,
-          data.is_test === true || data.is_test === 'true' || false,
-        ],
-      );
-
-      await client.query('COMMIT');
-      const applicant = result.rows[0];
-      return applicant;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+  // Profile methods live in features/applicant-profile/applicant-profile.service.ts; delegates keep callers unchanged.
+  create(...args: Parameters<typeof ApplicantProfileService.create>) {
+    return ApplicantProfileService.create(...args);
   }
 
-  async changePassword(
-    applicantId: number,
-    currentPasswordRaw: string,
-    newPasswordRaw: string,
-  ) {
-    const result = await pool.query(
-      'SELECT password_hash FROM applicants WHERE id = $1',
-      [applicantId],
-    );
-    const applicant = result.rows[0];
-    if (!applicant || !applicant.password_hash) {
-      throw new Error('User not found or no password set');
-    }
-    const isMatch = await bcrypt.compare(
-      currentPasswordRaw,
-      applicant.password_hash,
-    );
-    if (!isMatch) {
-      throw new Error('Incorrect current password');
-    }
-    const newPasswordHash = await bcrypt.hash(newPasswordRaw, 10);
-    await pool.query('UPDATE applicants SET password_hash = $1 WHERE id = $2', [
-      newPasswordHash,
-      applicantId,
-    ]);
-    return true;
+  changePassword(...args: Parameters<typeof ApplicantProfileService.changePassword>) {
+    return ApplicantProfileService.changePassword(...args);
   }
 
-  async update(id: number, data: any) {
-    const fields: string[] = [];
-    const values: any[] = [];
-    let idx = 1;
-
-    const addField = (colName: string, val: any, isJson = false) => {
-      if (val !== undefined) {
-        fields.push(`${colName} = $${idx}`);
-        values.push(isJson ? JSON.stringify(val) : val);
-        idx++;
-      }
-    };
-
-    addField('surname', data.surname);
-    addField('first_name', data.first_name);
-    addField('middle_name', data.middle_name);
-    if (data.date_of_birth !== undefined) {
-      addField(
-        'date_of_birth',
-        data.date_of_birth ? new Date(data.date_of_birth) : null,
-      );
-      addField('age', calculateAge(data.date_of_birth));
-    }
-    addField('place_of_birth', data.place_of_birth);
-    addField('sex', data.sex);
-    addField('civil_status', data.civil_status);
-    addField('citizenship', data.citizenship);
-    addField('blood_type', data.blood_type);
-    addField('religion', data.religion);
-    addField('disability', data.disability);
-    addField('ethnic_group', data.ethnic_group);
-    addField('gsis_id_no', data.gsis_id_no);
-    addField('pag_ibig_id_no', data.pag_ibig_id_no);
-    addField('philhealth_no', data.philhealth_no);
-    addField('sss_no', data.sss_no);
-    addField('residential_address', data.residential_address, true);
-    addField('permanent_address', data.permanent_address, true);
-    addField('telephone_no', data.telephone_no);
-    addField('mobile_no', data.mobile_no);
-    addField('alternate_email', data.alternate_email);
-
-    addField('educational_background', data.educational_background, true);
-    if (data.educational_background !== undefined) {
-      addField(
-        'bachelors_degree',
-        extractBachelorsDegree(data.educational_background),
-      );
-    }
-    addField('family_background', data.family_background, true);
-    if (data.family_background) {
-      addField('spouse_surname', data.family_background.spouse?.surname);
-      addField('spouse_first_name', data.family_background.spouse?.first_name);
-      addField(
-        'spouse_middle_name',
-        data.family_background.spouse?.middle_name,
-      );
-      addField(
-        'spouse_name_extension',
-        data.family_background.spouse?.name_extension,
-      );
-      addField('spouse_occupation', data.family_background.spouse?.occupation);
-      addField(
-        'spouse_employer_business',
-        data.family_background.spouse?.employer_business_name,
-      );
-      addField(
-        'spouse_business_address',
-        data.family_background.spouse?.business_address,
-      );
-      addField('spouse_telephone', data.family_background.spouse?.telephone_no);
-      addField('father_surname', data.family_background.father?.surname);
-      addField('father_first_name', data.family_background.father?.first_name);
-      addField(
-        'father_middle_name',
-        data.family_background.father?.middle_name,
-      );
-      addField(
-        'father_name_extension',
-        data.family_background.father?.name_extension,
-      );
-      addField(
-        'mother_maiden_surname',
-        data.family_background.mother?.maiden_surname,
-      );
-      addField('mother_first_name', data.family_background.mother?.first_name);
-      addField(
-        'mother_middle_name',
-        data.family_background.mother?.middle_name,
-      );
-      addField('children_details', data.family_background.children, true);
-    }
-
-    addField('civil_service_eligibility', data.civil_service_eligibility, true);
-    if (data.civil_service_eligibility !== undefined) {
-      addField(
-        'eligibility',
-        extractEligibility(data.civil_service_eligibility),
-      );
-    }
-    addField('work_experience', data.work_experience, true);
-    if (data.work_experience !== undefined) {
-      addField('years_experience', calculateExperience(data.work_experience));
-    }
-    addField('voluntary_work', data.voluntary_work, true);
-    addField('learning_and_development', data.learning_and_development, true);
-    if (data.learning_and_development !== undefined) {
-      addField(
-        'training_hours',
-        calculateTraining(data.learning_and_development),
-      );
-    }
-
-    if (data.other_information !== undefined) {
-      // 1. Fetch current other_information from DB
-      const currentRes = await pool.query(
-        'SELECT other_information FROM applicants WHERE id = $1',
-        [id],
-      );
-      let currentOtherInfo = currentRes.rows[0]?.other_information || {};
-      if (typeof currentOtherInfo === 'string') {
-        try {
-          currentOtherInfo = JSON.parse(currentOtherInfo);
-        } catch {
-          currentOtherInfo = {};
-        }
-      }
-
-      // 2. Parse incoming other_information
-      let incomingOtherInfo = data.other_information || {};
-      if (typeof incomingOtherInfo === 'string') {
-        try {
-          incomingOtherInfo = JSON.parse(incomingOtherInfo);
-        } catch {
-          incomingOtherInfo = {};
-        }
-      }
-
-      // 3. Fetch latest audit records for all document types of this applicant
-      const latestAudits = await this.getLatestDocumentAudits(id);
-      const auditMap: Record<string, string> = {};
-      for (const audit of latestAudits) {
-        if (audit.document_type && audit.new_blob_url) {
-          auditMap[audit.document_type] = audit.new_blob_url;
-        }
-      }
-
-      // 4. Merge documents: protect only document URLs, keep metadata editable
-      const existingDocs =
-        (currentOtherInfo &&
-          typeof currentOtherInfo === 'object' &&
-          currentOtherInfo.documents) ||
-        {};
-      const incomingDocs =
-        (incomingOtherInfo &&
-          typeof incomingOtherInfo === 'object' &&
-          incomingOtherInfo.documents) ||
-        {};
-
-      const mergedDocs: Record<string, any> = {};
-      const allDocKeys = new Set([
-        ...Object.keys(existingDocs),
-        ...Object.keys(incomingDocs),
-      ]);
-
-      for (const docKey of allDocKeys) {
-        const existingDoc = existingDocs[docKey];
-        const incomingDoc = incomingDocs[docKey];
-
-        // 4a. Authoritative URL resolution:
-        // Priority: latest new_blob_url in document_audit_logs -> existing stored URL in DB
-        // Never use incoming URL. Never overwrite existing valid URL with null.
-        let authoritativeUrl: string | null = null;
-        if (auditMap[docKey]) {
-          authoritativeUrl = auditMap[docKey];
-        } else if (typeof existingDoc === 'string' && existingDoc.trim()) {
-          authoritativeUrl = existingDoc.trim();
-        } else if (
-          existingDoc &&
-          typeof existingDoc === 'object' &&
-          typeof existingDoc.url === 'string' &&
-          existingDoc.url.trim()
-        ) {
-          authoritativeUrl = existingDoc.url.trim();
-        }
-
-        // 4b. Merge document metadata (fileName, uploadedAt, remarks, etc.)
-        if (
-          incomingDoc &&
-          typeof incomingDoc === 'object' &&
-          !Array.isArray(incomingDoc)
-        ) {
-          const existingObj =
-            existingDoc &&
-              typeof existingDoc === 'object' &&
-              !Array.isArray(existingDoc)
-              ? existingDoc
-              : {};
-          mergedDocs[docKey] = {
-            ...existingObj,
-            ...incomingDoc,
-          };
-          if (authoritativeUrl) {
-            mergedDocs[docKey].url = authoritativeUrl;
-          } else {
-            delete mergedDocs[docKey].url;
-          }
-        } else if (
-          existingDoc &&
-          typeof existingDoc === 'object' &&
-          !Array.isArray(existingDoc)
-        ) {
-          mergedDocs[docKey] = {
-            ...existingDoc,
-          };
-          if (authoritativeUrl) {
-            mergedDocs[docKey].url = authoritativeUrl;
-          } else {
-            delete mergedDocs[docKey].url;
-          }
-        } else {
-          // String format document URL
-          if (authoritativeUrl) {
-            mergedDocs[docKey] = authoritativeUrl;
-          }
-        }
-      }
-
-      // 5. Compose final other_information preserving all non-document fields
-      data.other_information = {
-        ...currentOtherInfo,
-        ...incomingOtherInfo,
-        documents: mergedDocs,
-      };
-    }
-
-    addField('other_information', data.other_information, true);
-    addField('questionnaire_responses', data.questionnaire_responses, true);
-
-    if (fields.length === 0) return null;
-
-    values.push(id);
-    const query = `UPDATE applicants SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${idx} RETURNING *`;
-
-    const result = await pool.query(query, values);
-    return result.rows[0];
+  update(...args: Parameters<typeof ApplicantProfileService.update>) {
+    return ApplicantProfileService.update(...args);
   }
 
-  async forgotPassword(email: string) {
-    const result = await pool.query(
-      'SELECT id FROM applicants WHERE email_address = $1',
-      [email],
-    );
-    if (result.rows.length === 0) {
-      return false;
-    }
-
-    const applicantId = result.rows[0].id;
-    const secret = process.env.JWT_SECRET || 'fallback_secret';
-    const token = jwt.sign({ applicantId }, secret, { expiresIn: '1h' });
-
-    await sendPasswordResetEmail(email, token);
-    return true;
+  forgotPassword(...args: Parameters<typeof ApplicantProfileService.forgotPassword>) {
+    return ApplicantProfileService.forgotPassword(...args);
   }
 
-  async resetPassword(token: string, newPassword: string) {
-    const secret = process.env.JWT_SECRET || 'fallback_secret';
-    try {
-      const decoded: any = jwt.verify(token, secret);
-      if (!decoded || !decoded.applicantId) {
-        throw new Error('Invalid token structure');
-      }
-
-      const applicantId = decoded.applicantId;
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(newPassword, salt);
-
-      const result = await pool.query(
-        'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
-        [passwordHash, applicantId],
-      );
-
-      if (result.rows.length === 0) {
-        throw new Error('Applicant not found');
-      }
-      return true;
-    } catch (error) {
-      throw new Error('Invalid or expired token');
-    }
+  resetPassword(...args: Parameters<typeof ApplicantProfileService.resetPassword>) {
+    return ApplicantProfileService.resetPassword(...args);
   }
 
-  async setPasscode(applicantId: number, passcode: string) {
-    if (!/^\d{6}$/.test(passcode)) {
-      throw new Error('Passcode must be exactly 6 digits.');
-    }
-    const result = await pool.query(
-      'UPDATE applicants SET passcode = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
-      [passcode, applicantId],
-    );
-    if (result.rows.length === 0) {
-      throw new Error('Applicant not found');
-    }
-    return true;
+  setPasscode(...args: Parameters<typeof ApplicantProfileService.setPasscode>) {
+    return ApplicantProfileService.setPasscode(...args);
   }
 
-  async replaceApplicantDocument(
-    applicantId: number,
-    docType: 'Letter of Intent' | 'Sworn Declaration',
-    newBlobUrl: string,
-    targetApplicationIds?: string[],
-  ) {
-    // The whole transaction is retried on deadlock (40P01) / serialization (40001).
-    return withDeadlockRetry(() =>
-      this.replaceApplicantDocumentOnce(
-        applicantId,
-        docType,
-        newBlobUrl,
-        targetApplicationIds,
-      ),
-    );
+
+  // Document methods live in features/documents/documents.service.ts; delegates keep callers unchanged.
+  replaceApplicantDocument(...args: Parameters<typeof DocumentsService.replaceApplicantDocument>) {
+    return DocumentsService.replaceApplicantDocument(...args);
   }
 
-  private async replaceApplicantDocumentOnce(
-    applicantId: number,
-    docType: 'Letter of Intent' | 'Sworn Declaration',
-    newBlobUrl: string,
-    targetApplicationIds?: string[],
-  ) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // 1. Fetch and lock applicant profile
-      const appRes = await client.query(
-        'SELECT * FROM applicants WHERE id = $1 FOR UPDATE',
-        [applicantId],
-      );
-      if (appRes.rows.length === 0) {
-        throw new Error('Applicant profile not found');
-      }
-      const applicant = appRes.rows[0];
-
-      let otherInfo = applicant.other_information || {};
-      if (typeof otherInfo === 'string') {
-        try {
-          otherInfo = JSON.parse(otherInfo);
-        } catch { }
-      }
-      if (!otherInfo.documents) otherInfo.documents = {};
-
-      const oldBlobUrl = otherInfo.documents[docType] || null;
-
-      // 2. Always update applicant master profile other_information.documents with newest blob URL for future applications
-      otherInfo.documents[docType] = newBlobUrl;
-      await client.query(
-        'UPDATE applicants SET other_information = $1, updated_at = NOW() WHERE id = $2',
-        [JSON.stringify(otherInfo), applicantId],
-      );
-
-      // 3. Conditionally update applications: ONLY update if the job cluster is OPEN in the vacancies table
-      // If the vacancy/cluster is closed/expired, retain the original blob ID
-      const columnToUpdate = APPLICATION_DOC_COLUMNS[docType];
-      if (!columnToUpdate) {
-        throw new Error(`Unsupported document type: ${String(docType)}`);
-      }
-
-      let updateRes;
-      if (
-        targetApplicationIds &&
-        Array.isArray(targetApplicationIds) &&
-        targetApplicationIds.length > 0
-      ) {
-        updateRes = await client.query(
-          `UPDATE applications a
-           SET ${columnToUpdate} = $1, updated_at = NOW() 
-           WHERE a.id = ANY($2::text[]) 
-             AND (a.applicant_id = $3 OR a.applicant_id = $4) 
-             AND (a.status IS NULL OR a.status NOT IN ('Hired', 'Archived', 'Cancelled', 'Rejected'))
-             AND EXISTS (
-               SELECT 1 FROM vacancies v 
-               WHERE v.job_cluster_id::text = a.job_cluster_id::text 
-                 AND LOWER(v.status) = 'open'
-                 AND (v.posting_end IS NULL OR v.posting_end::date >= CURRENT_DATE)
-                 AND (v.posting_start IS NULL OR v.posting_start::date <= CURRENT_DATE)
-                 AND (v.filling_up_status = 'UNFILLED' OR v.filling_up_status IS NULL)
-             )
-           RETURNING a.id`,
-          [
-            newBlobUrl,
-            targetApplicationIds,
-            applicantId,
-            applicantId.toString(),
-          ],
-        );
-      } else {
-        updateRes = await client.query(
-          `UPDATE applications a
-           SET ${columnToUpdate} = $1, updated_at = NOW() 
-           WHERE (a.applicant_id = $2 OR a.applicant_id = $3) 
-             AND (a.status IS NULL OR a.status NOT IN ('Hired', 'Archived', 'Cancelled', 'Rejected'))
-             AND EXISTS (
-               SELECT 1 FROM vacancies v 
-               WHERE v.job_cluster_id::text = a.job_cluster_id::text 
-                 AND LOWER(v.status) = 'open'
-                 AND (v.posting_end IS NULL OR v.posting_end::date >= CURRENT_DATE)
-                 AND (v.posting_start IS NULL OR v.posting_start::date <= CURRENT_DATE)
-                 AND (v.filling_up_status = 'UNFILLED' OR v.filling_up_status IS NULL)
-             )
-           RETURNING a.id`,
-          [newBlobUrl, applicantId, applicantId.toString()],
-        );
-      }
-
-      const updatedAppIds = (updateRes.rows || []).map((r: any) => r.id);
-      const affectedCount = updatedAppIds.length;
-
-      // 4. Generate concurrency-safe batch number and insert per-application audit records
-      const batchNumber = await this.getNextBatchNumber(applicantId, client);
-      await this.logDocumentAuditPerApplication(
-        applicantId,
-        docType,
-        newBlobUrl,
-        batchNumber,
-        client,
-      );
-
-      await client.query('COMMIT');
-
-      return {
-        success: true,
-        batchNumber,
-        newUrl: newBlobUrl,
-        oldUrl: oldBlobUrl,
-        affectedApplications: affectedCount,
-        updatedApplicationIds: updatedAppIds,
-        targetApplicationIds: targetApplicationIds || [],
-        documents: otherInfo.documents,
-      };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+  getNextBatchNumber(...args: Parameters<typeof DocumentsService.getNextBatchNumber>) {
+    return DocumentsService.getNextBatchNumber(...args);
   }
 
-  async getNextBatchNumber(
-    applicantId: string | number,
-    client?: any,
-  ): Promise<number> {
-    const db = client || pool;
-    if (client) {
-      // Transaction-level advisory lock on applicant ID
-      await client.query('SELECT pg_advisory_xact_lock($1)', [
-        Number(applicantId),
-      ]);
-    }
-
-    const res = await db.query(
-      `SELECT (COALESCE(
-         (SELECT CASE WHEN batch_number ~ '^[0-9]+$' THEN batch_number::int ELSE 0 END
-          FROM document_audit_logs
-          WHERE applicant_id = $1
-          ORDER BY CASE WHEN batch_number ~ '^[0-9]+$' THEN batch_number::int ELSE 0 END DESC
-          LIMIT 1), 0) + 1) AS next_batch`,
-      [applicantId.toString()],
-    );
-    return parseInt(res.rows[0].next_batch, 10);
+  batchLogDocumentAuditRecords(...args: Parameters<typeof DocumentsService.batchLogDocumentAuditRecords>) {
+    return DocumentsService.batchLogDocumentAuditRecords(...args);
   }
 
-  async batchLogDocumentAuditRecords(
-    records: Array<{
-      applicantId: string | number;
-      docType: string;
-      newBlobUrl: string;
-      affectedCount: number;
-      applicationId: string | null;
-      isOpen: boolean;
-      batchNumber: string | number;
-    }>,
-    client?: any,
-  ) {
-    if (records.length === 0) return [];
-    const db = client || pool;
-
-    const values: any[] = [];
-    const valuePlaceholders: string[] = [];
-
-    records.forEach((rec, idx) => {
-      const baseIdx = idx * 7;
-      valuePlaceholders.push(
-        `($${baseIdx + 1}, $${baseIdx + 2}, $${baseIdx + 3}, $${baseIdx + 4}, $${baseIdx + 5}, $${baseIdx + 6}, $${baseIdx + 7}, NOW())`,
-      );
-      values.push(
-        rec.applicantId.toString(),
-        rec.docType,
-        rec.newBlobUrl,
-        rec.affectedCount,
-        rec.applicationId,
-        rec.isOpen,
-        rec.batchNumber.toString(),
-      );
-    });
-
-    const queryText = `
-      INSERT INTO document_audit_logs (
-        applicant_id,
-        document_type,
-        new_blob_url,
-        affected_applications_count,
-        application_id,
-        is_open,
-        batch_number,
-        created_at
-      ) VALUES ${valuePlaceholders.join(',\n')}
-      RETURNING *
-    `;
-
-    const result = await db.query(queryText, values);
-    return result.rows;
+  logDocumentAuditPerApplication(...args: Parameters<typeof DocumentsService.logDocumentAuditPerApplication>) {
+    return DocumentsService.logDocumentAuditPerApplication(...args);
   }
 
-  async logDocumentAuditPerApplication(
-    applicantId: string | number,
-    docType: string,
-    newBlobUrl: string,
-    batchNumber: number,
-    client?: any,
-  ): Promise<number> {
-    const db = client || pool;
-
-    // 1. Determine all applications for the applicant and their vacancy status
-    const appsRes = await db.query(
-      `SELECT a.id,
-              EXISTS (
-                SELECT 1 FROM vacancies v 
-                WHERE v.job_cluster_id::text = a.job_cluster_id::text 
-                  AND LOWER(v.status) = 'open'
-              ) AS is_open
-       FROM applications a
-       WHERE a.applicant_id = $1`,
-      [applicantId.toString()],
-    );
-
-    const applications = appsRes.rows;
-    const applicationCount = applications.length;
-
-    if (applicationCount === 0) {
-      await this.batchLogDocumentAuditRecords(
-        [
-          {
-            applicantId,
-            docType,
-            newBlobUrl,
-            affectedCount: 0,
-            applicationId: null,
-            isOpen: true,
-            batchNumber,
-          },
-        ],
-        db,
-      );
-    } else {
-      const records = applications.map((app: any) => ({
-        applicantId,
-        docType,
-        newBlobUrl,
-        affectedCount: applicationCount,
-        applicationId: app.id,
-        isOpen: app.is_open,
-        batchNumber,
-      }));
-      await this.batchLogDocumentAuditRecords(records, db);
-    }
-
-    return applicationCount;
+  saveApplicantDocuments(...args: Parameters<typeof DocumentsService.saveApplicantDocuments>) {
+    return DocumentsService.saveApplicantDocuments(...args);
   }
 
-  async saveApplicantDocuments(
-    applicantId: number,
-    uploadedDocs: Array<{ docName: string; url: string }>,
-  ) {
-    // Retried on deadlock (40P01) / serialization (40001) failures.
-    return withDeadlockRetry(() =>
-      this.saveApplicantDocumentsOnce(applicantId, uploadedDocs),
-    );
+  logDocumentAudit(...args: Parameters<typeof DocumentsService.logDocumentAudit>) {
+    return DocumentsService.logDocumentAudit(...args);
   }
 
-  private async saveApplicantDocumentsOnce(
-    applicantId: number,
-    uploadedDocs: Array<{ docName: string; url: string }>,
-  ) {
-    if (uploadedDocs.length === 0) {
-      return {
-        success: true,
-        affectedApplications: 0,
-        batchNumber: 0,
-        documents: {},
-      };
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // 1. Concurrency-safe batch number generation with transaction lock
-      const batchNumber = await this.getNextBatchNumber(applicantId, client);
-
-      // 2. Fetch and lock applicant
-      const appRes = await client.query(
-        'SELECT * FROM applicants WHERE id = $1 FOR UPDATE',
-        [applicantId],
-      );
-      if (appRes.rows.length === 0) {
-        throw new Error('Applicant not found');
-      }
-
-      let otherInfo = appRes.rows[0].other_information || {};
-      if (typeof otherInfo === 'string') {
-        try {
-          otherInfo = JSON.parse(otherInfo);
-        } catch {
-          otherInfo = {};
-        }
-      }
-      if (!otherInfo.documents) otherInfo.documents = {};
-
-      // 3. Query all applications for the applicant once
-      const appsRes = await client.query(
-        `SELECT a.id,
-                EXISTS (
-                  SELECT 1 FROM vacancies v 
-                  WHERE v.job_cluster_id::text = a.job_cluster_id::text 
-                    AND LOWER(v.status) = 'open'
-                ) AS is_open
-         FROM applications a
-         WHERE a.applicant_id = $1`,
-        [applicantId.toString()],
-      );
-
-      const applications = appsRes.rows;
-      const applicationCount = applications.length;
-
-      // 4. Build all audit records for simultaneous single-query batch insertion
-      const auditRecords: Array<{
-        applicantId: string | number;
-        docType: string;
-        newBlobUrl: string;
-        affectedCount: number;
-        applicationId: string | null;
-        isOpen: boolean;
-        batchNumber: string | number;
-      }> = [];
-
-      let hasLoi = false;
-      let loiUrl = '';
-      let hasSworn = false;
-      let swornUrl = '';
-
-      for (const { docName, url } of uploadedDocs) {
-        otherInfo.documents[docName] = url;
-        if (docName === 'profile_photo' || docName === 'Profile Photo') {
-          otherInfo.photoUrl = url;
-        }
-
-        if (docName === 'Letter of Intent') {
-          hasLoi = true;
-          loiUrl = url;
-        }
-        if (docName === 'Sworn Declaration') {
-          hasSworn = true;
-          swornUrl = url;
-        }
-
-        if (applicationCount === 0) {
-          auditRecords.push({
-            applicantId,
-            docType: docName,
-            newBlobUrl: url,
-            affectedCount: 0,
-            applicationId: null,
-            isOpen: true,
-            batchNumber,
-          });
-        } else {
-          for (const app of applications) {
-            auditRecords.push({
-              applicantId,
-              docType: docName,
-              newBlobUrl: url,
-              affectedCount: applicationCount,
-              applicationId: app.id,
-              isOpen: app.is_open,
-              batchNumber,
-            });
-          }
-        }
-      }
-
-      // Execute simultaneous multi-row batch insert in 1 SQL query
-      if (auditRecords.length > 0) {
-        await this.batchLogDocumentAuditRecords(auditRecords, client);
-      }
-
-      // 5. Update open applications if Letter of Intent or Sworn Declaration were uploaded
-      if (hasLoi) {
-        await client.query(
-          `UPDATE applications a
-           SET letter_of_intent = $1, updated_at = NOW()
-           WHERE a.applicant_id = $2
-             AND (a.status IS NULL OR a.status NOT IN ('Hired', 'Archived', 'Cancelled', 'Rejected'))
-             AND EXISTS (
-               SELECT 1 FROM vacancies v
-               WHERE v.job_cluster_id::text = a.job_cluster_id::text
-                 AND LOWER(v.status) = 'open'
-             )`,
-          [loiUrl, applicantId.toString()],
-        );
-      }
-      if (hasSworn) {
-        await client.query(
-          `UPDATE applications a
-           SET sworn_document = $1, updated_at = NOW()
-           WHERE a.applicant_id = $2
-             AND (a.status IS NULL OR a.status NOT IN ('Hired', 'Archived', 'Cancelled', 'Rejected'))
-             AND EXISTS (
-               SELECT 1 FROM vacancies v
-               WHERE v.job_cluster_id::text = a.job_cluster_id::text
-                 AND LOWER(v.status) = 'open'
-             )`,
-          [swornUrl, applicantId.toString()],
-        );
-      }
-
-      // 6. Update applicant master profile
-      await client.query(
-        'UPDATE applicants SET other_information = $1, updated_at = NOW() WHERE id = $2',
-        [JSON.stringify(otherInfo), applicantId],
-      );
-
-      await client.query('COMMIT');
-
-      return {
-        success: true,
-        batchNumber,
-        affectedApplications: applicationCount,
-        documents: otherInfo.documents,
-      };
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+  getLatestDocumentAudit(...args: Parameters<typeof DocumentsService.getLatestDocumentAudit>) {
+    return DocumentsService.getLatestDocumentAudit(...args);
   }
 
-  async logDocumentAudit(
-    applicantId: string | number,
-    docType: string,
-    newBlobUrl: string,
-    affectedCount: number = 0,
-    applicationId: string | null = null,
-    isOpen: boolean = true,
-    batchNumber?: string | number,
-  ) {
-    try {
-      let resolvedBatchNumber = batchNumber;
-      if (resolvedBatchNumber === undefined || resolvedBatchNumber === null) {
-        resolvedBatchNumber = await this.getNextBatchNumber(applicantId);
-      }
-
-      const result = await pool.query(
-        `INSERT INTO document_audit_logs (applicant_id, document_type, new_blob_url, affected_applications_count, application_id, is_open, batch_number, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-         RETURNING *`,
-        [
-          applicantId.toString(),
-          docType,
-          newBlobUrl,
-          affectedCount,
-          applicationId,
-          isOpen,
-          resolvedBatchNumber.toString(),
-        ],
-      );
-      return result.rows[0];
-    } catch (error) {
-      console.error('Error logging document audit:', error);
-      return null;
-    }
+  getLatestDocumentAudits(...args: Parameters<typeof DocumentsService.getLatestDocumentAudits>) {
+    return DocumentsService.getLatestDocumentAudits(...args);
   }
 
-  async getLatestDocumentAudit(
-    applicantId: string | number,
-    documentType: string,
-    client?: any,
-  ) {
-    const db = client || pool;
-    const result = await db.query(
-      `SELECT *
-       FROM public.document_audit_logs
-       WHERE applicant_id = $1
-         AND document_type = $2
-       ORDER BY id DESC
-       LIMIT 1`,
-      [applicantId.toString(), documentType],
-    );
-    return result.rows[0] || null;
+  getDocumentAuditLogs(...args: Parameters<typeof DocumentsService.getDocumentAuditLogs>) {
+    return DocumentsService.getDocumentAuditLogs(...args);
   }
 
-  async getLatestDocumentAudits(applicantId: string | number, client?: any) {
-    const db = client || pool;
-    const result = await db.query(
-      `SELECT DISTINCT ON (document_type)
-         *
-       FROM public.document_audit_logs
-       WHERE applicant_id = $1
-       ORDER BY document_type, id DESC`,
-      [applicantId.toString()],
-    );
-    return result.rows;
-  }
-
-  async getDocumentAuditLogs(
-    applicantId: string | number,
-    latestOnly: boolean = false,
-  ) {
-    if (latestOnly) {
-      return this.getLatestDocumentAudits(applicantId);
-    }
-    const result = await pool.query(
-      `SELECT * FROM document_audit_logs 
-       WHERE applicant_id = $1 
-       ORDER BY created_at DESC, id DESC`,
-      [applicantId.toString()],
-    );
-    return result.rows;
-  }
 
   async ensureReclassificationApplication(
     applicantId: number | null,
@@ -1924,28 +535,26 @@ class ApplicantsServiceClass {
 
     if (plantillaItemNumber) {
       const incRes = await pool.query(
-        `SELECT r.*, g.initial_assessment, g.psi_cd as gmis_psi_cd
-         FROM ${RECLASS_GC_FULL} r
-         LEFT JOIN gmis_gc_items g ON (
-           (r.item_no IS NOT NULL AND TRIM(r.item_no) <> '' AND UPPER(TRIM(g.psi_cd)) = UPPER(TRIM(r.item_no)))
-           OR (r.new_item_no IS NOT NULL AND TRIM(r.new_item_no) <> '' AND UPPER(TRIM(g.psi_cd)) = UPPER(TRIM(r.new_item_no)))
-           OR g.reclass_gc_id = r.id
-         )
-         WHERE UPPER(TRIM(r.item_no)) = UPPER(TRIM($1))
-            OR UPPER(TRIM(r.new_item_no)) = UPPER(TRIM($1))
+        `SELECT r.*, ir.reclass_position AS initial_assessment, ir.psi_cd AS gmis_psi_cd,
+                ir.region AS ir_region, ir.division AS ir_division, ir.pos_dsc AS ir_pos_dsc,
+                ir.incumbent AS ir_incumbent, ir.sg AS ir_sg
+         FROM reclass_gc r
+         LEFT JOIN ref.initial_reclass ir
+           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(r.initial_reclass_psi_cd, '')))
+         WHERE UPPER(TRIM(COALESCE(r.initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
+            OR UPPER(TRIM(COALESCE(r.new_item_no, ''))) = UPPER(TRIM($1))
          LIMIT 1`,
         [plantillaItemNumber],
       );
       incumbent = incRes.rows[0] || null;
     } else if (appRow?.surname && appRow?.first_name) {
       const incByName = await pool.query(
-        `SELECT r.*, g.initial_assessment, g.psi_cd as gmis_psi_cd
-         FROM ${RECLASS_GC_FULL} r
-         LEFT JOIN gmis_gc_items g ON (
-           (r.item_no IS NOT NULL AND TRIM(r.item_no) <> '' AND UPPER(TRIM(g.psi_cd)) = UPPER(TRIM(r.item_no)))
-           OR (r.new_item_no IS NOT NULL AND TRIM(r.new_item_no) <> '' AND UPPER(TRIM(g.psi_cd)) = UPPER(TRIM(r.new_item_no)))
-           OR g.reclass_gc_id = r.id
-         )
+        `SELECT r.*, ir.reclass_position AS initial_assessment, ir.psi_cd AS gmis_psi_cd,
+                ir.region AS ir_region, ir.division AS ir_division, ir.pos_dsc AS ir_pos_dsc,
+                ir.incumbent AS ir_incumbent, ir.sg AS ir_sg
+         FROM reclass_gc r
+         LEFT JOIN ref.initial_reclass ir
+           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(r.initial_reclass_psi_cd, '')))
          WHERE UPPER(TRIM(r.last_name)) = UPPER(TRIM($1)) AND UPPER(TRIM(r.first_name)) = UPPER(TRIM($2))
          LIMIT 1`,
         [appRow.surname, appRow.first_name],
@@ -1956,13 +565,12 @@ class ApplicantsServiceClass {
     if (!incumbent && (appRow?.email || appRow?.email_address)) {
       const email = appRow.email || appRow.email_address;
       const incByEmail = await pool.query(
-        `SELECT r.*, g.initial_assessment, g.psi_cd as gmis_psi_cd
-         FROM ${RECLASS_GC_FULL} r
-         LEFT JOIN gmis_gc_items g ON (
-           (r.item_no IS NOT NULL AND TRIM(r.item_no) <> '' AND UPPER(TRIM(g.psi_cd)) = UPPER(TRIM(r.item_no)))
-           OR (r.new_item_no IS NOT NULL AND TRIM(r.new_item_no) <> '' AND UPPER(TRIM(g.psi_cd)) = UPPER(TRIM(r.new_item_no)))
-           OR g.reclass_gc_id = r.id
-         )
+        `SELECT r.*, ir.reclass_position AS initial_assessment, ir.psi_cd AS gmis_psi_cd,
+                ir.region AS ir_region, ir.division AS ir_division, ir.pos_dsc AS ir_pos_dsc,
+                ir.incumbent AS ir_incumbent, ir.sg AS ir_sg
+         FROM reclass_gc r
+         LEFT JOIN ref.initial_reclass ir
+           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(r.initial_reclass_psi_cd, '')))
          WHERE LOWER(TRIM(r.email)) = LOWER(TRIM($1))
          LIMIT 1`,
         [email],
@@ -1971,19 +579,20 @@ class ApplicantsServiceClass {
     }
 
     if (!incumbent && plantillaItemNumber) {
-      const gmisOnly = await pool.query(
-        `SELECT *, initial_assessment FROM gmis_gc_items WHERE UPPER(TRIM(psi_cd)) = UPPER(TRIM($1)) LIMIT 1`,
+      const irOnly = await pool.query(
+        `SELECT * FROM ref.initial_reclass WHERE UPPER(TRIM(COALESCE(psi_cd, ''))) = UPPER(TRIM($1)) LIMIT 1`,
         [plantillaItemNumber],
       );
-      if (gmisOnly.rows[0]) {
+      if (irOnly.rows[0]) {
+        const parsed = this.parseIncumbentName(irOnly.rows[0].incumbent);
         incumbent = {
-          item_no: gmisOnly.rows[0].psi_cd,
-          current_position: gmisOnly.rows[0].pos_dsc,
-          first_name: gmisOnly.rows[0].first_name,
-          last_name: gmisOnly.rows[0].last_name,
-          region: gmisOnly.rows[0].region,
-          division: gmisOnly.rows[0].division,
-          initial_assessment: gmisOnly.rows[0].initial_assessment,
+          initial_reclass_psi_cd: irOnly.rows[0].psi_cd,
+          current_position: irOnly.rows[0].pos_dsc,
+          first_name: parsed.firstName,
+          last_name: parsed.lastName,
+          region: irOnly.rows[0].region,
+          division: irOnly.rows[0].division,
+          initial_assessment: irOnly.rows[0].reclass_position,
         };
       }
     }
@@ -2109,7 +718,10 @@ class ApplicantsServiceClass {
         : '';
 
     // Count uploaded reclass documents
-    const plantilla = incumbent?.item_no || plantillaItemNumber;
+    const plantilla =
+      incumbent?.initial_reclass_psi_cd ||
+      incumbent?.item_no ||
+      plantillaItemNumber;
     let docCount = 0;
     if (plantilla) {
       const cRes = await pool.query(
@@ -2174,7 +786,13 @@ class ApplicantsServiceClass {
       ...(incumbent || {}),
       new_position: newPosition,
       full_name: fullName,
-      plantilla_item_number: incumbent?.item_no || plantillaItemNumber || null,
+      plantilla_item_number:
+        incumbent?.initial_reclass_psi_cd ||
+        incumbent?.item_no ||
+        plantillaItemNumber ||
+        null,
+      region: incumbent?.region || incumbent?.ir_region || null,
+      division: incumbent?.division || incumbent?.ir_division || null,
       position_title: posTitle,
       position_salary_grade: positionSalaryGrade,
       target_position: targetPosition,
@@ -2653,30 +1271,57 @@ class ApplicantsServiceClass {
     }));
   }
 
+  private parseIncumbentName(incumbent: any): { firstName: string; lastName: string } {
+    const raw = String(incumbent ?? '').trim();
+    const upper = raw.toUpperCase();
+    if (!raw || upper === 'NULL' || upper === 'N/A' || upper === '#N/A') {
+      return { firstName: '', lastName: '' };
+    }
+    const commaIdx = raw.indexOf(',');
+    if (commaIdx > 0) {
+      return {
+        lastName: raw.slice(0, commaIdx).trim(),
+        firstName: raw.slice(commaIdx + 1).trim(),
+      };
+    }
+    return { firstName: raw, lastName: '' };
+  }
+
+  private isValidIndicativeReclass(val: any): boolean {
+    const raw = String(val ?? '').trim().toUpperCase();
+    return Boolean(
+      raw &&
+      raw !== 'NULL' &&
+      raw !== 'N/A' &&
+      raw !== '#N/A' &&
+      raw !== 'UNASSIGNED' &&
+      raw !== '—',
+    );
+  }
+
   async checkCredentialsStatus(itemNumber: string) {
     const normalized = (itemNumber || '').trim().toUpperCase();
     if (!normalized) return null;
 
     const gcRes = await pool.query(
-      `SELECT * FROM ${RECLASS_GC_FULL} reclass_gc
-       WHERE UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($1))
+      `SELECT * FROM reclass_gc
+       WHERE UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
           OR UPPER(TRIM(COALESCE(new_item_no, ''))) = UPPER(TRIM($1))
        LIMIT 1`,
       [normalized],
     );
 
-    const gmisRes = await pool.query(
-      `SELECT * FROM gmis_gc_items
+    const irRes = await pool.query(
+      `SELECT * FROM ref.initial_reclass
        WHERE UPPER(TRIM(COALESCE(psi_cd, ''))) = UPPER(TRIM($1))
-       ORDER BY id ASC
        LIMIT 1`,
       [normalized],
     );
 
     const inc = gcRes.rows[0] || null;
-    const gmis = gmisRes.rows[0] || null;
+    const ir = irRes.rows[0] || null;
 
-    if (!inc && !gmis) return null;
+    if (!inc && !ir) return null;
 
     const isBlank = (val: any) =>
       val === null ||
@@ -2688,48 +1333,46 @@ class ApplicantsServiceClass {
     const incPassNull = isBlank(inc?.password_hash) && isBlank(inc?.password);
     const incPasscodeNull = isBlank(inc?.passcode);
 
-    const gmisEmailNull = isBlank(gmis?.email);
-    const gmisPassNull = isBlank(gmis?.password) && isBlank(gmis?.password_hash);
-    const gmisPasscodeNull = isBlank(gmis?.passcode);
-
     // Permit registration/claim if existing record's email, password, and passcode are all NULL
     const canClaim =
       incEmailNull &&
       incPassNull &&
-      incPasscodeNull &&
-      gmisEmailNull &&
-      gmisPassNull &&
-      gmisPasscodeNull;
+      incPasscodeNull;
 
-    const item = inc || gmis;
+    const parsedName = this.parseIncumbentName(ir?.incumbent);
+    const firstName = parsedName.firstName.trim().toUpperCase();
+    const lastName = parsedName.lastName.trim().toUpperCase();
+    const initialAssessment = ir?.reclass_position || '';
+
     return {
       canClaim,
-      data: item
-        ? {
-            item_number: (item.item_no || item.psi_cd || normalized).toUpperCase(),
-            current_position: (item.current_position || item.pos_dsc || 'GUIDANCE COUNSELOR').toUpperCase(),
-            region: (item.region || '').toUpperCase(),
-            division: (item.division || '').toUpperCase(),
-            school_name: (item.school_name || '').toUpperCase(),
-            school_id: item.school_id || '',
-            first_name: (item.first_name || '').trim().toUpperCase(),
-            last_name: (item.last_name || '').trim().toUpperCase(),
-            email: '',
-            mobile_number: item.mobile_number || '',
-            initial_assessment: gmis?.initial_assessment || item.initial_assessment || '',
-            indicative_reclassification: gmis?.initial_assessment || item.initial_assessment || '',
-            education: (item.education || '').toUpperCase(),
-            years_experience:
-              item.years_experience !== undefined && item.years_experience !== null
-                ? String(item.years_experience)
-                : '',
-            hours_of_training:
-              item.hours_of_training !== undefined && item.hours_of_training !== null
-                ? String(item.hours_of_training)
-                : '',
-            eligibility: (item.eligibility || '').toUpperCase(),
-          }
-        : null,
+      data:
+        inc || ir
+          ? {
+              item_number: (inc?.initial_reclass_psi_cd || ir?.psi_cd || normalized).toUpperCase(),
+              current_position: (inc?.current_position || ir?.pos_dsc || 'GUIDANCE COUNSELOR').toUpperCase(),
+              region: (ir?.region || '').toUpperCase(),
+              division: (ir?.division || '').toUpperCase(),
+              school_name: (inc?.school_name || '').toUpperCase(),
+              school_id: inc?.school_id || '',
+              first_name: firstName,
+              last_name: lastName,
+              email: '',
+              mobile_number: inc?.mobile_number || '',
+              initial_assessment: initialAssessment,
+              indicative_reclassification: initialAssessment,
+              education: (inc?.education || '').toUpperCase(),
+              years_experience:
+                inc?.years_experience !== undefined && inc?.years_experience !== null
+                  ? String(inc.years_experience)
+                  : '',
+              hours_of_training:
+                inc?.hours_of_training !== undefined && inc?.hours_of_training !== null
+                  ? String(inc.hours_of_training)
+                  : '',
+              eligibility: (inc?.eligibility || '').toUpperCase(),
+            }
+          : null,
     };
   }
 
@@ -2745,52 +1388,42 @@ class ApplicantsServiceClass {
       };
     }
 
-    // 1. Verify existence in gmis_gc_items
-    const gmisRes = await pool.query(
-      `SELECT * FROM gmis_gc_items 
+    // 1. Verify existence in ref.initial_reclass
+    const irRes = await pool.query(
+      `SELECT * FROM ref.initial_reclass
        WHERE UPPER(TRIM(COALESCE(psi_cd, ''))) = UPPER(TRIM($1))
-       ORDER BY id ASC
        LIMIT 1`,
       [normalized],
     );
 
-    if (gmisRes.rows.length === 0) {
+    if (irRes.rows.length === 0) {
       return {
         status: 'not_found',
-        message: 'No records found for this Plantilla Item Number in GMIS.',
+        message: 'No records found for this Plantilla Item Number in initial_reclass.',
       };
     }
 
-    const gmisItem = gmisRes.rows[0];
+    const irItem = irRes.rows[0];
 
     // Strict Validation: Only filled guidance counselor items with an existing indicative reclassification are allowed to register
-    const fPos = String(gmisItem.f_pos || '').trim().toUpperCase();
-    if (fPos !== 'FILLED') {
+    const parsedName = this.parseIncumbentName(irItem.incumbent);
+    if (!parsedName.firstName && !parsedName.lastName) {
       return {
         status: 'invalid',
         message: 'Registration is restricted to filled guidance counselor positions only. This plantilla item is currently unfilled/vacant.',
       };
     }
 
-    const posTitle = String(gmisItem.pos_dsc || gmisItem.current_position || '').trim().toUpperCase();
-    if (!posTitle.includes('GUIDANCE')) {
+    const posTitle = String(irItem.pos_dsc || '').trim().toUpperCase();
+    if (posTitle && !posTitle.includes('GUIDANCE')) {
       return {
         status: 'invalid',
         message: 'Registration is restricted to Guidance Counselor plantilla positions only.',
       };
     }
 
-    const rawInitialAssessment = gmisItem.initial_assessment ? String(gmisItem.initial_assessment).trim() : '';
-    const hasInitialAssessment = Boolean(
-      rawInitialAssessment &&
-      rawInitialAssessment.toUpperCase() !== 'NULL' &&
-      rawInitialAssessment.toUpperCase() !== 'N/A' &&
-      rawInitialAssessment.toUpperCase() !== '#N/A' &&
-      rawInitialAssessment.toUpperCase() !== 'UNASSIGNED' &&
-      rawInitialAssessment.toUpperCase() !== '—'
-    );
-
-    if (!hasInitialAssessment) {
+    const rawInitialAssessment = irItem.reclass_position ? String(irItem.reclass_position).trim() : '';
+    if (!this.isValidIndicativeReclass(rawInitialAssessment)) {
       return {
         status: 'invalid',
         message: 'Registration is restricted to guidance counselor items with an existing indicative reclassification. This plantilla item has no indicative reclassification on record.',
@@ -2799,8 +1432,8 @@ class ApplicantsServiceClass {
 
     // Check existing registration status in reclass_gc
     const gcRes = await pool.query(
-      `SELECT * FROM ${RECLASS_GC_FULL} reclass_gc
-       WHERE UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($1))
+      `SELECT * FROM reclass_gc
+       WHERE UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
           OR UPPER(TRIM(COALESCE(new_item_no, ''))) = UPPER(TRIM($1))
        LIMIT 1`,
       [normalized],
@@ -2819,21 +1452,12 @@ class ApplicantsServiceClass {
       inc && (!isBlank(inc.password_hash) || !isBlank(inc.password));
     const incHasPasscode = inc && !isBlank(inc.passcode);
 
-    const gmisHasEmail = !isBlank(gmisItem.email);
-    const gmisHasPassword =
-      !isBlank(gmisItem.password) ||
-      !isBlank(gmisItem.password_hash);
-    const gmisHasPasscode = !isBlank(gmisItem.passcode);
-
     // If existing record's email, password, and passcode are all NULL,
     // bypass the HTTP 409 conflict error and permit registration/claiming
     const credentialsAreNull =
       !incHasEmail &&
       !incHasPassword &&
-      !incHasPasscode &&
-      !gmisHasEmail &&
-      !gmisHasPassword &&
-      !gmisHasPasscode;
+      !incHasPasscode;
 
     if (!credentialsAreNull) {
       // Check if already registered in applicants table
@@ -2871,25 +1495,19 @@ class ApplicantsServiceClass {
     if (!inc) {
       const insertGcRes = await pool.query(
         `INSERT INTO reclass_gc (
-          item_no,
+          initial_reclass_psi_cd,
           current_position,
-          school_id,
-          school_name,
           stage_of_reclassification,
           desired_position,
-          gmis_id,
           is_test,
           created_at,
           updated_at
-        ) VALUES ($1, $2, $3, $4, 'UPDATING OF DOCUMENTS', $5, $6, false, NOW(), NOW())
+        ) VALUES ($1, $2, 'FOR REVIEW', $3, false, NOW(), NOW())
         RETURNING *`,
         [
-          normalized,
-          gmisItem.pos_dsc || gmisItem.current_position || 'Guidance Counselor',
-          gmisItem.school_id || null,
-          gmisItem.school_name || null,
-          gmisItem.initial_assessment || null,
-          gmisItem.id || null,
+          irItem.psi_cd || normalized,
+          irItem.pos_dsc || 'Guidance Counselor',
+          rawInitialAssessment || null,
         ],
       );
       inc = insertGcRes.rows[0];
@@ -2898,15 +1516,15 @@ class ApplicantsServiceClass {
     return {
       status: 'valid',
       data: {
-        item_number: (inc.item_no || normalized).toUpperCase(),
-        current_position: (inc.current_position || gmisItem.pos_dsc || 'GUIDANCE COUNSELOR').toUpperCase(),
-        region: (inc.region || gmisItem.region || '').toUpperCase(),
-        division: (inc.division || gmisItem.division || '').toUpperCase(),
-        school_name: (inc.school_name || gmisItem.school_name || '').toUpperCase(),
-        school_id: inc.school_id || gmisItem.school_id || '',
-        first_name: (inc.first_name || gmisItem.first_name || '').trim().toUpperCase(),
-        last_name: (inc.last_name || gmisItem.last_name || '').trim().toUpperCase(),
-        email: (inc.email || gmisItem.email || '').trim().toLowerCase(),
+        item_number: (inc.initial_reclass_psi_cd || irItem.psi_cd || normalized).toUpperCase(),
+        current_position: (inc.current_position || irItem.pos_dsc || 'GUIDANCE COUNSELOR').toUpperCase(),
+        region: (irItem.region || '').toUpperCase(),
+        division: (irItem.division || '').toUpperCase(),
+        school_name: (inc.school_name || '').toUpperCase(),
+        school_id: inc.school_id || '',
+        first_name: parsedName.firstName.trim().toUpperCase(),
+        last_name: parsedName.lastName.trim().toUpperCase(),
+        email: (inc.email || '').trim().toLowerCase(),
         mobile_number: inc.mobile_number || '',
         initial_assessment: rawInitialAssessment,
         indicative_reclassification: rawInitialAssessment,
@@ -2957,28 +1575,27 @@ class ApplicantsServiceClass {
       throw new Error('Passcode must be exactly 6 numeric digits.');
     }
 
-    // 1. Verify against GMIS records in gmis_gc_items
+    // 1. Verify against ref.initial_reclass (joined with gmis_gc_items for optional GMIS link/school info)
     let inc: any = null;
 
     // Strict validation: Only filled guidance counselor items with an existing indicative reclassification are allowed to register
-    const gmisRes = await pool.query(
-      `SELECT * FROM gmis_gc_items
+    const irRes = await pool.query(
+      `SELECT * FROM ref.initial_reclass
        WHERE UPPER(TRIM(COALESCE(psi_cd, ''))) = UPPER(TRIM($1))
-       ORDER BY id ASC
        LIMIT 1`,
       [normalizedItemNo],
     );
 
-    if (gmisRes.rows.length === 0) {
-      const err: any = new Error('No records found for this Plantilla Item Number in GMIS.');
+    if (irRes.rows.length === 0) {
+      const err: any = new Error('No records found for this Plantilla Item Number in initial_reclass.');
       err.statusCode = 404;
       throw err;
     }
 
-    const gmisItem = gmisRes.rows[0];
+    const irItem = irRes.rows[0];
+    const parsedName = this.parseIncumbentName(irItem.incumbent);
 
-    const fPos = String(gmisItem.f_pos || '').trim().toUpperCase();
-    if (fPos !== 'FILLED') {
+    if (!parsedName.firstName && !parsedName.lastName) {
       const err: any = new Error(
         'Registration is restricted to filled guidance counselor positions only. This plantilla item is currently unfilled/vacant.',
       );
@@ -2986,8 +1603,8 @@ class ApplicantsServiceClass {
       throw err;
     }
 
-    const posTitle = String(gmisItem.pos_dsc || gmisItem.current_position || '').trim().toUpperCase();
-    if (!posTitle.includes('GUIDANCE')) {
+    const posTitle = String(irItem.pos_dsc || '').trim().toUpperCase();
+    if (posTitle && !posTitle.includes('GUIDANCE')) {
       const err: any = new Error(
         'Registration is restricted to Guidance Counselor plantilla positions only.',
       );
@@ -2995,17 +1612,8 @@ class ApplicantsServiceClass {
       throw err;
     }
 
-    const rawInitialAssessment = gmisItem.initial_assessment ? String(gmisItem.initial_assessment).trim() : '';
-    const hasInitialAssessment = Boolean(
-      rawInitialAssessment &&
-      rawInitialAssessment.toUpperCase() !== 'NULL' &&
-      rawInitialAssessment.toUpperCase() !== 'N/A' &&
-      rawInitialAssessment.toUpperCase() !== '#N/A' &&
-      rawInitialAssessment.toUpperCase() !== 'UNASSIGNED' &&
-      rawInitialAssessment.toUpperCase() !== '—'
-    );
-
-    if (!hasInitialAssessment) {
+    const rawInitialAssessment = irItem.reclass_position ? String(irItem.reclass_position).trim() : '';
+    if (!this.isValidIndicativeReclass(rawInitialAssessment)) {
       const err: any = new Error(
         'Registration is restricted to guidance counselor items with an existing indicative reclassification. This plantilla item has no indicative reclassification on record.',
       );
@@ -3015,8 +1623,8 @@ class ApplicantsServiceClass {
 
     // 2. Check if already in reclass_gc
     const gcRes = await pool.query(
-      `SELECT * FROM ${RECLASS_GC_FULL} reclass_gc
-       WHERE UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($1))
+      `SELECT * FROM reclass_gc
+       WHERE UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
           OR UPPER(TRIM(COALESCE(new_item_no, ''))) = UPPER(TRIM($1))
        LIMIT 1`,
       [normalizedItemNo],
@@ -3028,25 +1636,19 @@ class ApplicantsServiceClass {
       // Register in the table of reclass_gc
       const insertGcRes = await pool.query(
         `INSERT INTO reclass_gc (
-          item_no,
+          initial_reclass_psi_cd,
           current_position,
-          school_id,
-          school_name,
           stage_of_reclassification,
           desired_position,
-          gmis_id,
           is_test,
           created_at,
           updated_at
-        ) VALUES ($1, $2, $3, $4, 'UPDATING OF DOCUMENTS', $5, $6, false, NOW(), NOW())
+        ) VALUES ($1, $2, 'FOR REVIEW', $3, false, NOW(), NOW())
         RETURNING *`,
         [
-          normalizedItemNo,
-          gmisItem.pos_dsc || gmisItem.current_position || 'Guidance Counselor',
-          gmisItem.school_id || null,
-          gmisItem.school_name || null,
-          gmisItem.initial_assessment || null,
-          gmisItem.id || null,
+          irItem.psi_cd || normalizedItemNo,
+          irItem.pos_dsc || 'Guidance Counselor',
+          rawInitialAssessment || null,
         ],
       );
       inc = insertGcRes.rows[0];
@@ -3062,26 +1664,22 @@ class ApplicantsServiceClass {
     const incPassNull = isBlank(inc?.password_hash) && isBlank(inc?.password);
     const incPasscodeNull = isBlank(inc?.passcode);
 
-    const gmisEmailNull = isBlank(gmisItem?.email);
-    const gmisPassNull = isBlank(gmisItem?.password) && isBlank(gmisItem?.password_hash);
-    const gmisPasscodeNull = isBlank(gmisItem?.passcode);
-
-    // If existing record's email, password, and passcode are all NULL in reclass_gc and gmis_gc_items,
+    // If existing record's email, password, and passcode are all NULL in reclass_gc,
     // this plantilla item is unclaimed and available to be claimed by registration.
     const isUnclaimedItem =
       incEmailNull &&
       incPassNull &&
-      incPasscodeNull &&
-      gmisEmailNull &&
-      gmisPassNull &&
-      gmisPasscodeNull;
+      incPasscodeNull;
+
+    const fallbackFirstName = parsedName.firstName.trim();
+    const fallbackLastName = parsedName.lastName.trim();
 
     const finalFirstName = isNewApp
-      ? (cleanFirstName || (inc.first_name ? inc.first_name.trim().toUpperCase() : 'APPLICANT'))
-      : (cleanFirstName || inc.first_name || 'Applicant');
+      ? (cleanFirstName || (fallbackFirstName ? fallbackFirstName.toUpperCase() : 'APPLICANT'))
+      : (cleanFirstName || fallbackFirstName || 'Applicant');
     const finalLastName = isNewApp
-      ? (cleanLastName || (inc.last_name ? inc.last_name.trim().toUpperCase() : 'RECLASS'))
-      : (cleanLastName || inc.last_name || 'Reclass');
+      ? (cleanLastName || (fallbackLastName ? fallbackLastName.toUpperCase() : 'RECLASS'))
+      : (cleanLastName || fallbackLastName || 'Reclass');
 
     // 2. Check existing applicant for this plantilla item number
     const existingItem = await pool.query(
@@ -3115,9 +1713,9 @@ class ApplicantsServiceClass {
 
     // Check uniqueness of email in reclass_gc for any other plantilla item number
     const existingReclassEmail = await pool.query(
-      `SELECT item_no, email, password_hash, password, passcode FROM reclass_gc 
+      `SELECT initial_reclass_psi_cd, email, password_hash, password, passcode FROM reclass_gc 
        WHERE LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
-         AND UPPER(TRIM(COALESCE(item_no, ''))) <> UPPER(TRIM($2))
+         AND UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) <> UPPER(TRIM($2))
        LIMIT 1`,
       [cleanEmail, normalizedItemNo],
     );
@@ -3172,17 +1770,17 @@ class ApplicantsServiceClass {
       await client.query('LOCK TABLE applicants IN EXCLUSIVE MODE');
 
       const designation = isNewApp
-        ? (data.current_position || inc.current_position || 'GUIDANCE COUNSELOR').trim().toUpperCase()
-        : (inc.current_position || data.current_position || 'Guidance Counselor');
+        ? (data.current_position || inc.current_position || irItem.pos_dsc || 'GUIDANCE COUNSELOR').trim().toUpperCase()
+        : (inc.current_position || irItem.pos_dsc || data.current_position || 'Guidance Counselor');
       const region = isNewApp
-        ? (data.region || inc.region ? String(data.region || inc.region).trim().toUpperCase() : null)
-        : (inc.region || data.region || null);
+        ? (data.region || irItem.region ? String(data.region || irItem.region).trim().toUpperCase() : null)
+        : (irItem.region || data.region || null);
       const division = isNewApp
-        ? (data.division || inc.division ? String(data.division || inc.division).trim().toUpperCase() : null)
-        : (inc.division || data.division || null);
+        ? (data.division || irItem.division ? String(data.division || irItem.division).trim().toUpperCase() : null)
+        : (irItem.division || data.division || null);
       const schoolName = isNewApp
         ? (data.school_name || inc.school_name ? String(data.school_name || inc.school_name).trim().toUpperCase() : null)
-        : (data.school_name || null);
+        : (data.school_name || inc.school_name || null);
       const education = isNewApp
         ? (data.education ? String(data.education).trim().toUpperCase() : (inc.education ? String(inc.education).trim().toUpperCase() : null))
         : (data.education || null);
@@ -3317,9 +1915,9 @@ class ApplicantsServiceClass {
           eligibility = COALESCE($9, eligibility),
           school_name = COALESCE($10, school_name),
           current_position = COALESCE($11, current_position),
-          stage_of_reclassification = COALESCE(stage_of_reclassification, 'UPDATING OF DOCUMENTS'),
+          stage_of_reclassification = COALESCE(stage_of_reclassification, 'FOR REVIEW'),
           updated_at = NOW() 
-        WHERE UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($12)) 
+        WHERE UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($12)) 
            OR UPPER(TRIM(COALESCE(new_item_no, ''))) = UPPER(TRIM($12))
            OR id = $13`,
         [
@@ -3338,17 +1936,6 @@ class ApplicantsServiceClass {
           inc.id,
         ],
       );
-
-      // Update email in gmis_gc_items if column exists
-      try {
-        await client.query(
-          `UPDATE gmis_gc_items SET email = $1 
-           WHERE UPPER(TRIM(COALESCE(psi_cd, ''))) = UPPER(TRIM($2))`,
-          [cleanEmail, normalizedItemNo],
-        );
-      } catch (gmisErr) {
-        console.warn('Note: Could not update email in gmis_gc_items:', gmisErr);
-      }
 
       await client.query('COMMIT');
 
@@ -3458,9 +2045,12 @@ class ApplicantsServiceClass {
     if (!applicant) {
       // Fallback: check if record exists in reclass_gc directly
       const gcRes = await pool.query(
-        `SELECT * FROM ${RECLASS_GC_FULL} reclass_gc 
-         WHERE LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1)) 
-            OR UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($1))
+        `SELECT g.*, ir.incumbent, ir.region AS ir_region, ir.division AS ir_division, ir.pos_dsc AS ir_pos_dsc
+         FROM reclass_gc g
+         LEFT JOIN ref.initial_reclass ir
+           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, '')))
+         WHERE LOWER(TRIM(COALESCE(g.email, ''))) = LOWER(TRIM($1)) 
+            OR UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
          LIMIT 1`,
         [cleanIdentifier],
       );
@@ -3483,6 +2073,7 @@ class ApplicantsServiceClass {
 
         if (isGcMatch) {
           // Link / create applicant for this session
+          const parsedGcName = this.parseIncumbentName(gc.incumbent);
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
@@ -3501,8 +2092,8 @@ class ApplicantsServiceClass {
               ) RETURNING *`,
               [
                 newApplicantNumber,
-                gc.last_name || '',
-                gc.first_name || '',
+                parsedGcName.lastName || '',
+                parsedGcName.firstName || '',
                 gc.email || `${cleanIdentifier.toLowerCase()}@deped.gov.ph`,
                 gc.password_hash,
                 gc.passcode
@@ -3512,10 +2103,10 @@ class ApplicantsServiceClass {
                   : null,
                 gc.passcode,
                 gc.mobile_number,
-                gc.item_no,
-                gc.current_position || 'Guidance Counselor',
-                gc.region,
-                gc.division,
+                gc.initial_reclass_psi_cd,
+                gc.current_position || gc.ir_pos_dsc || 'Guidance Counselor',
+                gc.ir_region || null,
+                gc.ir_division || null,
               ],
             );
             applicant = insertApp.rows[0];
@@ -3537,8 +2128,13 @@ class ApplicantsServiceClass {
     let incumbent: any = null;
     if (applicant.plantilla_item_number) {
       const incRes = await pool.query(
-        `SELECT * FROM ${RECLASS_GC_FULL} reclass_gc 
-         WHERE UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($1)) 
+        `SELECT g.*, ir.incumbent, ir.region AS ir_region, ir.division AS ir_division,
+                ir.pos_dsc AS ir_pos_dsc, ir.reclass_position AS ir_reclass_position
+         FROM reclass_gc g
+         LEFT JOIN ref.initial_reclass ir
+           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, '')))
+         WHERE UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
+            OR UPPER(TRIM(COALESCE(g.new_item_no, ''))) = UPPER(TRIM($1))
          LIMIT 1`,
         [applicant.plantilla_item_number],
       );
@@ -3583,19 +2179,22 @@ class ApplicantsServiceClass {
       plantilla_item_number: applicant.plantilla_item_number,
       current_position:
         incumbent?.current_position ||
+        incumbent?.ir_pos_dsc ||
         applicant.current_designation ||
         'Guidance Counselor',
       target_position:
         incumbent?.target_position ||
         reclassApp?.reclass_position ||
         incumbent?.reclass_position ||
+        incumbent?.ir_reclass_position ||
         null,
       reclass_position:
         incumbent?.reclass_position ||
         reclassApp?.reclass_position ||
+        incumbent?.ir_reclass_position ||
         null,
-      region: incumbent?.region || applicant.region || null,
-      division: incumbent?.division || applicant.division || null,
+      region: incumbent?.region || incumbent?.ir_region || applicant.region || null,
+      division: incumbent?.division || incumbent?.ir_division || applicant.division || null,
       school_name: incumbent?.school_name || null,
       application_number:
         incumbent?.school_name || incumbent?.application_number || null,
@@ -4016,7 +2615,10 @@ class ApplicantsServiceClass {
     const reclassDetails = await this.getReclassDetails(applicantId);
     let reclassAppId = reclassDetails?.reclass_application?.id || null;
     let plantillaItemNumber =
-      reclassDetails?.plantilla_item_number || reclassDetails?.item_no || null;
+      reclassDetails?.plantilla_item_number ||
+      reclassDetails?.initial_reclass_psi_cd ||
+      reclassDetails?.item_no ||
+      null;
 
     // Direct lookup on applicants & reclass_gc to ensure reliable linkage
     let reclassGcRow: any = null;
@@ -4031,10 +2633,13 @@ class ApplicantsServiceClass {
         plantillaItemNumber = appPlantilla;
       }
 
-      // Check reclass_gc by item_no or name
+      // Check reclass_gc by initial_reclass_psi_cd / new_item_no or name
       if (plantillaItemNumber) {
         const gcCheck = await pool.query(
-          `SELECT * FROM ${RECLASS_GC_FULL} reclass_gc WHERE UPPER(TRIM(COALESCE(item_no, ''))) = UPPER(TRIM($1)) LIMIT 1`,
+          `SELECT * FROM reclass_gc
+           WHERE UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
+              OR UPPER(TRIM(COALESCE(new_item_no, ''))) = UPPER(TRIM($1))
+           LIMIT 1`,
           [plantillaItemNumber],
         );
         if (gcCheck.rows.length > 0) {
@@ -4051,8 +2656,8 @@ class ApplicantsServiceClass {
         );
         if (gcCheckByName.rows.length > 0) {
           reclassGcRow = gcCheckByName.rows[0];
-          if (!plantillaItemNumber && reclassGcRow.item_no) {
-            plantillaItemNumber = reclassGcRow.item_no;
+          if (!plantillaItemNumber && reclassGcRow.initial_reclass_psi_cd) {
+            plantillaItemNumber = reclassGcRow.initial_reclass_psi_cd;
           }
         }
       }
@@ -4396,6 +3001,10 @@ class ApplicantsServiceClass {
         [folderGcId || -1, plantillaItemNumber || null],
       );
 
+      // Collected per row, then written with two bulk UPDATEs after the loop.
+      const checklistUpdates: Array<{ id: number; checklist: string }> = [];
+      const plainUpdateIds: number[] = [];
+
       for (const gcRow of gcRows.rows) {
         let checklist = gcRow.document_checklist;
         let isUpdated = false;
@@ -4463,25 +3072,39 @@ class ApplicantsServiceClass {
         }
 
         if (isUpdated) {
-          await pool.query(
-            `UPDATE reclass_gc
-             SET document_checklist = $1,
-                 reupload = true,
-                 new_application = true,
-                 updated_at = NOW()
-             WHERE id = $2`,
-            [JSON.stringify(checklist), gcRow.id],
-          );
+          checklistUpdates.push({
+            id: gcRow.id,
+            checklist: JSON.stringify(checklist),
+          });
         } else {
-          await pool.query(
-            `UPDATE reclass_gc
-             SET reupload = true,
-                 new_application = true,
-                 updated_at = NOW()
-             WHERE id = $1`,
-            [gcRow.id],
-          );
+          plainUpdateIds.push(gcRow.id);
         }
+      }
+
+      if (checklistUpdates.length > 0) {
+        await pool.query(
+          `UPDATE reclass_gc g
+           SET document_checklist = v.checklist::jsonb,
+               reupload = true,
+               new_application = true,
+               updated_at = NOW()
+           FROM unnest($1::int[], $2::text[]) AS v(id, checklist)
+           WHERE g.id = v.id`,
+          [
+            checklistUpdates.map((u) => u.id),
+            checklistUpdates.map((u) => u.checklist),
+          ],
+        );
+      }
+      if (plainUpdateIds.length > 0) {
+        await pool.query(
+          `UPDATE reclass_gc
+           SET reupload = true,
+               new_application = true,
+               updated_at = NOW()
+           WHERE id = ANY($1::int[])`,
+          [plainUpdateIds],
+        );
       }
     } catch (checkErr) {
       console.error('Error updating document_checklist on re-upload:', checkErr);

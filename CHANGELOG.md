@@ -1,5 +1,26 @@
 # AGAP Portal — Changelog & Architecture Notes
 
+## [2026-11-12] [Architecture] Folder-audit cleanup (phased)
+- **Health routes**: `/health` and `/` moved from `backend/src/index.ts` to `backend/src/health/health.routes.ts` (same URLs).
+- **apply-job**: readiness validation extracted verbatim to `validateApplicationReadiness` in `features/applications/applications.service.ts`; same 400 messages.
+- **Documents**: document and audit methods moved verbatim from `applicants.service.ts` to `features/documents/documents.service.ts`; `ApplicantsService` keeps delegating methods so callers and URLs are unchanged.
+- **Frontend boundaries**: `frontend/eslint.config.mjs` adds `import/no-cycle` and a features-must-not-import-features rule; wired into the frontend `lint`/`lint:check` after oxlint.
+- **Backend features** (routes/controller/service each, same URLs; `ApplicantsService` keeps delegating methods): `features/documents`, `features/pds` (template path depth adjusted for the new folder), `features/applications` (apply-job, applications, saved jobs), `features/applicant-profile` (parse-resume, profile CRUD, passcode, change-password). Routers are mounted before the legacy applicants router in `index.ts`; its `/:id` handler still falls through with `next()` for non-numeric ids.
+- **Frontend pages**: pure constants/helpers extracted to `features/{login,dashboard,job-list}`; Login branding banner, welcome modal and tour overlay, and JobList PDF viewer, Letter of Intent and Sworn Declaration modals extracted to `components/` (markup, classes and behaviour unchanged).
+- **Not yet done**: the page component bodies are still large (Login ~2.5k, Dashboard ~2.5k, JobList ~3.8k lines) and the reclass methods remain in `applicants.service.ts` (~3.5k lines).
+
+## [2026-11-12] [Security/DB] Follow-ups
+- **Removed `GET /api/applicants`** (and `ApplicantsService.findAll`): it was unauthenticated and returned every applicant row including password/passcode hashes. The frontend only uses POST/PUT on this path.
+- **Indexes**: `index_cleanup_migration.sql` also drops redundant prefix indexes on `agap_invited`, `applications`, `conversations` (only when the wider index exists); boot DDL no longer recreates `idx_agap_invited_email` when a wider email index exists.
+- **Deploy**: both GitHub workflows now run `npm run migrate:schema` after the backend build and before the PM2 restart (boot no longer migrates).
+- **Login lookup indexes**: expression indexes on `applicants` matching the login query (`LOWER/UPPER(TRIM(COALESCE(...)))`); login miss query 51 ms to 0.05 ms locally.
+- **Docs**: `docs/orm-optimizer/report-2026-11-12.md` re-run on analyzed data with EXPLAIN plans.
+
+## [2026-11-12] [DB/Perf] ORM optimizer follow-up
+- **Indexes**: new idempotent `backend/database/migrations/index_cleanup_migration.sql` (run by `npm run migrate:schema`) drops duplicate indexes (only when the surviving twin exists), drops the duplicate `unique_saved_cluster` constraint, and indexes 9 unindexed FK columns. Boot DDL now creates `idx_reclass_documents_item_no` instead of `idx_reclass_docs_plantilla`.
+- **Queries**: vacancies applied-clusters query no longer casts `applicant_id::text`; reclass re-upload checklist updates are two bulk UPDATEs; `findByEmail`, applyJob duplicate check, `toggleSavedJob` and the vacancies query select explicit columns. Remaining `SELECT *` sites intentionally kept where the full row (incl. JSON) is consumed.
+- **Address**: `getRegions` cached in memory (1h, `ADDRESS_REGIONS_CACHE_TTL_MS`). **export-backup.js**: pool `max: 2`.
+
 ## [2026-11-12] [Database/Reclass] Adapt to dropped `reclass_gc` identity columns
 - The shared DB dropped `reclass_gc.first_name`, `last_name`, `region`, `division`, `reclass_position` (backup: `reclass_gc_identity_backup`). Names now come from `gmis_gc_items` (via `gmis_id`); region, division and reclass_position from `ref.initial_reclass` (via `item_no`).
 - `applicants.service.ts`: added `RECLASS_GC_FULL` derived table that re-projects those fields; read queries use it. INSERT/UPDATE on `reclass_gc` no longer write the dropped columns (Designate rows are linked via `gmis_id`).
