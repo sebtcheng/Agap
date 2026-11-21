@@ -441,7 +441,7 @@ export default function Login() {
       }
     } catch (err) {
       console.error('Verification error:', err);
-      setStepAError('Unable to verify with GMIS records. Please try again.');
+      setStepAError('Unable to verify Plantilla Item Number. Please try again.');
     } finally {
       setStepAVerifying(false);
     }
@@ -1899,7 +1899,7 @@ export default function Login() {
                           <div className="mt-1.5 p-2 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-800 text-[11px] flex items-center gap-1.5">
                             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                             <span>
-                              <strong>GMIS Match:</strong> {gmisDetails.designation || 'Incumbent'} ({gmisDetails.division || 'DepEd'})
+                              <strong>Record Match:</strong> {gmisDetails.designation || 'Incumbent'} ({gmisDetails.division || 'DepEd'})
                             </span>
                           </div>
                         )}
