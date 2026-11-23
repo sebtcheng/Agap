@@ -282,12 +282,20 @@ export async function reclassLogin(req: Request, res: Response) {
 // POST /forgot-password
 export async function forgotPassword(req: Request, res: Response) {
   const { email } = req.body;
-  if (!email) {
+  if (!email || !String(email).trim()) {
     return res.status(400).json({ message: 'Email is required' });
   }
   try {
+    let origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+    if (!origin && typeof req.headers.referer === 'string') {
+      try {
+        origin = new URL(req.headers.referer).origin;
+      } catch {
+        origin = undefined;
+      }
+    }
     // Always return success even if email is not found to prevent enumeration
-    await AuthService.forgotPassword(email);
+    await AuthService.forgotPassword(String(email).trim(), origin);
     res.json({
       success: true,
       message:
@@ -297,7 +305,7 @@ export async function forgotPassword(req: Request, res: Response) {
     console.error('Error in forgot-password:', error);
     res
       .status(500)
-      .json({ message: 'Error processing password reset request' });
+      .json({ message: error.message || 'Error processing password reset request' });
   }
 }
 

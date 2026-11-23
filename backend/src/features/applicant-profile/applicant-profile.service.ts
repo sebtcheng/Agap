@@ -599,20 +599,35 @@ class ApplicantProfileServiceClass {
     return result.rows[0];
   }
 
-  async forgotPassword(email: string) {
+  async forgotPassword(email: string, frontendOrigin?: string) {
+    const cleanEmail = String(email || '').trim();
+    if (!cleanEmail) return false;
+
     const result = await pool.query(
-      'SELECT id FROM applicants WHERE email_address = $1',
-      [email],
+      `SELECT id,
+              COALESCE(
+                NULLIF(TRIM(email_address), ''),
+                NULLIF(TRIM(email), ''),
+                NULLIF(TRIM(alternate_email), '')
+              ) AS target_email
+       FROM applicants
+       WHERE LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1))
+          OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
+          OR LOWER(TRIM(COALESCE(alternate_email, ''))) = LOWER(TRIM($1))
+       ORDER BY updated_at DESC NULLS LAST, id DESC
+       LIMIT 1`,
+      [cleanEmail],
     );
     if (result.rows.length === 0) {
       return false;
     }
 
     const applicantId = result.rows[0].id;
+    const targetEmail = result.rows[0].target_email || cleanEmail;
     const secret = process.env.JWT_SECRET || 'fallback_secret';
     const token = jwt.sign({ applicantId }, secret, { expiresIn: '1h' });
 
-    await sendPasswordResetEmail(email, token);
+    await sendPasswordResetEmail(targetEmail, token, frontendOrigin);
     return true;
   }
 

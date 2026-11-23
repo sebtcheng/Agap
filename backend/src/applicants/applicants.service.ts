@@ -1405,30 +1405,19 @@ class ApplicantsServiceClass {
 
     const irItem = irRes.rows[0];
 
-    // Strict Validation: Only filled guidance counselor items with an existing indicative reclassification are allowed to register
+    // Allow registration as long as initial_reclass.incumbent is not null/empty and not N/A
     const parsedName = this.parseIncumbentName(irItem.incumbent);
     if (!parsedName.firstName && !parsedName.lastName) {
       return {
         status: 'invalid',
-        message: 'Registration is restricted to filled guidance counselor positions only. This plantilla item is currently unfilled/vacant.',
-      };
-    }
-
-    const posTitle = String(irItem.pos_dsc || '').trim().toUpperCase();
-    if (posTitle && !posTitle.includes('GUIDANCE')) {
-      return {
-        status: 'invalid',
-        message: 'Registration is restricted to Guidance Counselor plantilla positions only.',
+        message: 'This plantilla item has no incumbent on record (unfilled/N/A). Only items with a valid incumbent can be registered.',
       };
     }
 
     const rawInitialAssessment = irItem.reclass_position ? String(irItem.reclass_position).trim() : '';
-    if (!this.isValidIndicativeReclass(rawInitialAssessment)) {
-      return {
-        status: 'invalid',
-        message: 'Registration is restricted to guidance counselor items with an existing indicative reclassification. This plantilla item has no indicative reclassification on record.',
-      };
-    }
+    const validInitialAssessment = this.isValidIndicativeReclass(rawInitialAssessment)
+      ? rawInitialAssessment
+      : '';
 
     // Check existing registration status in reclass_gc
     const gcRes = await pool.query(
@@ -1507,7 +1496,7 @@ class ApplicantsServiceClass {
         [
           irItem.psi_cd || normalized,
           irItem.pos_dsc || 'Guidance Counselor',
-          rawInitialAssessment || null,
+          validInitialAssessment || null,
         ],
       );
       inc = insertGcRes.rows[0];
@@ -1526,8 +1515,8 @@ class ApplicantsServiceClass {
         last_name: parsedName.lastName.trim().toUpperCase(),
         email: (inc.email || '').trim().toLowerCase(),
         mobile_number: inc.mobile_number || '',
-        initial_assessment: rawInitialAssessment,
-        indicative_reclassification: rawInitialAssessment,
+        initial_assessment: validInitialAssessment,
+        indicative_reclassification: validInitialAssessment,
         education: (inc.education || '').toUpperCase(),
         years_experience: inc.years_experience !== undefined && inc.years_experience !== null ? String(inc.years_experience) : '',
         hours_of_training: inc.hours_of_training !== undefined && inc.hours_of_training !== null ? String(inc.hours_of_training) : '',
@@ -1578,7 +1567,7 @@ class ApplicantsServiceClass {
     // 1. Verify against ref.initial_reclass (joined with gmis_gc_items for optional GMIS link/school info)
     let inc: any = null;
 
-    // Strict validation: Only filled guidance counselor items with an existing indicative reclassification are allowed to register
+    // Allow registration as long as initial_reclass.incumbent is not null/empty and not N/A
     const irRes = await pool.query(
       `SELECT * FROM ref.initial_reclass
        WHERE UPPER(TRIM(COALESCE(psi_cd, ''))) = UPPER(TRIM($1))
@@ -1597,29 +1586,16 @@ class ApplicantsServiceClass {
 
     if (!parsedName.firstName && !parsedName.lastName) {
       const err: any = new Error(
-        'Registration is restricted to filled guidance counselor positions only. This plantilla item is currently unfilled/vacant.',
-      );
-      err.statusCode = 400;
-      throw err;
-    }
-
-    const posTitle = String(irItem.pos_dsc || '').trim().toUpperCase();
-    if (posTitle && !posTitle.includes('GUIDANCE')) {
-      const err: any = new Error(
-        'Registration is restricted to Guidance Counselor plantilla positions only.',
+        'This plantilla item has no incumbent on record (unfilled/N/A). Only items with a valid incumbent can be registered.',
       );
       err.statusCode = 400;
       throw err;
     }
 
     const rawInitialAssessment = irItem.reclass_position ? String(irItem.reclass_position).trim() : '';
-    if (!this.isValidIndicativeReclass(rawInitialAssessment)) {
-      const err: any = new Error(
-        'Registration is restricted to guidance counselor items with an existing indicative reclassification. This plantilla item has no indicative reclassification on record.',
-      );
-      err.statusCode = 400;
-      throw err;
-    }
+    const validInitialAssessment = this.isValidIndicativeReclass(rawInitialAssessment)
+      ? rawInitialAssessment
+      : '';
 
     // 2. Check if already in reclass_gc
     const gcRes = await pool.query(
@@ -1648,7 +1624,7 @@ class ApplicantsServiceClass {
         [
           irItem.psi_cd || normalizedItemNo,
           irItem.pos_dsc || 'Guidance Counselor',
-          rawInitialAssessment || null,
+          validInitialAssessment || null,
         ],
       );
       inc = insertGcRes.rows[0];
