@@ -345,10 +345,25 @@ class ApplicantProfileServiceClass {
       throw new Error('Incorrect current password');
     }
     const newPasswordHash = await bcrypt.hash(newPasswordRaw, 10);
-    await pool.query('UPDATE applicants SET password_hash = $1 WHERE id = $2', [
-      newPasswordHash,
-      applicantId,
-    ]);
+    const updated = await pool.query(
+      'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING email_address, email, plantilla_item_number',
+      [newPasswordHash, applicantId],
+    );
+    const row = updated.rows[0];
+    if (row) {
+      await pool.query(
+        `UPDATE reclass_gc SET password_hash = $1, updated_at = NOW()
+         WHERE ($2 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($2)))
+            OR ($3 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($3)))
+            OR ($4 <> '' AND UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($4)))`,
+        [
+          newPasswordHash,
+          String(row.email_address || '').trim(),
+          String(row.email || '').trim(),
+          String(row.plantilla_item_number || '').trim(),
+        ],
+      );
+    }
     return true;
   }
 
@@ -599,12 +614,29 @@ class ApplicantProfileServiceClass {
     return result.rows[0];
   }
 
-  async forgotPassword(email: string) {
+  async forgotPassword(email: string, frontendOrigin?: string) {
+    const cleanEmail = String(email || '').trim();
+    if (!cleanEmail) return false;
+
     const result = await pool.query(
-      'SELECT id FROM applicants WHERE email_address = $1',
-      [email],
+      `SELECT id,
+              COALESCE(
+                NULLIF(TRIM(email_address), ''),
+                NULLIF(TRIM(email), ''),
+                NULLIF(TRIM(alternate_email), '')
+              ) AS target_email
+       FROM applicants
+       WHERE LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1))
+          OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
+          OR LOWER(TRIM(COALESCE(alternate_email, ''))) = LOWER(TRIM($1))
+       ORDER BY updated_at DESC NULLS LAST, id DESC
+       LIMIT 1`,
+      [cleanEmail],
     );
     if (result.rows.length === 0) {
+      console.warn(
+        `⚠️ Password reset requested for unregistered email (not found in applicants): ${cleanEmail}`,
+      );
       return false;
     }
 
@@ -612,7 +644,8 @@ class ApplicantProfileServiceClass {
     const secret = process.env.JWT_SECRET || 'fallback_secret';
     const token = jwt.sign({ applicantId }, secret, { expiresIn: '1h' });
 
-    await sendPasswordResetEmail(email, token);
+    console.log(`📧 Sending password reset email to ${cleanEmail} (applicant #${applicantId})...`);
+    await sendPasswordResetEmail(cleanEmail, token, frontendOrigin);
     return true;
   }
 
@@ -629,13 +662,27 @@ class ApplicantProfileServiceClass {
       const passwordHash = await bcrypt.hash(newPassword, salt);
 
       const result = await pool.query(
-        'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+        'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email_address, email, plantilla_item_number',
         [passwordHash, applicantId],
       );
 
       if (result.rows.length === 0) {
         throw new Error('Applicant not found');
       }
+
+      const row = result.rows[0];
+      await pool.query(
+        `UPDATE reclass_gc SET password_hash = $1, updated_at = NOW()
+         WHERE ($2 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($2)))
+            OR ($3 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($3)))
+            OR ($4 <> '' AND UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($4)))`,
+        [
+          passwordHash,
+          String(row.email_address || '').trim(),
+          String(row.email || '').trim(),
+          String(row.plantilla_item_number || '').trim(),
+        ],
+      );
       return true;
     } catch (error) {
       throw new Error('Invalid or expired token');

@@ -1,21 +1,32 @@
 import nodemailer from 'nodemailer';
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+function createTransporter() {
+  const user = process.env.EMAIL_USER?.trim();
+  const pass = process.env.EMAIL_PASS?.trim();
+  if (!user || !pass) {
+    throw new Error('Email service is not configured (EMAIL_USER / EMAIL_PASS missing).');
+  }
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user, pass },
+  });
+}
 
-export const sendPasswordResetEmail = async (email: string, token: string) => {
-  // Try to use VITE_API_URL or FRONTEND_URL environment variables, or default to standard frontend dev server
+export const sendPasswordResetEmail = async (
+  email: string,
+  token: string,
+  frontendOrigin?: string,
+) => {
+  const vitePort = process.env.VITE_PORT || '5174';
   const rawUrl =
-    process.env.VITE_API_URL ||
+    frontendOrigin ||
     process.env.FRONTEND_URL ||
-    'http://localhost:5173';
-  const frontendUrl = rawUrl.endsWith('/') ? rawUrl.slice(0, -1) : rawUrl;
-  const resetLink = `${frontendUrl}/reset-password?token=${token}`;
+    process.env.VITE_API_URL ||
+    `http://localhost:${vitePort}`;
+  const frontendUrl = rawUrl.replace(/\/+$/, '');
+  const basePath = (process.env.VITE_BASE_PATH || '').replace(/\/+$/, '');
+  const normalizedBase = basePath && basePath !== '/' ? basePath : '';
+  const resetLink = `${frontendUrl}${normalizedBase}/reset-password?token=${token}`;
 
   const mailOptions = {
     from: `"AGAP Portal" <${process.env.EMAIL_USER}>`,
@@ -38,6 +49,7 @@ export const sendPasswordResetEmail = async (email: string, token: string) => {
   };
 
   try {
+    const transporter = createTransporter();
     const info = await transporter.sendMail(mailOptions);
     console.log(`Password reset email sent to ${email}: ${info.messageId}`);
     return true;

@@ -4,6 +4,8 @@ import Swal from 'sweetalert2';
 import { Lock, EyeOff, Eye, ShieldCheck, User, Building2, BarChart3, Clock, ArrowLeft } from 'lucide-react';
 import modernLogo from '../assets/modern_logo.png';
 
+const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+
 export default function ResetPassword() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -37,7 +39,7 @@ export default function ResetPassword() {
 
     setLoading(true);
     try {
-      const response = await fetch(`${import.meta.env.VITE_API_URL}/api/applicants/reset-password`, {
+      const response = await fetch(`${API_BASE_URL}/api/applicants/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token, new_password: password })
@@ -60,13 +62,13 @@ export default function ResetPassword() {
   return (
     <div className="h-screen flex bg-[var(--bg-2)] relative overflow-hidden" style={{ fontFamily: 'var(--font-body)' }}>
       {/* Back Button */}
-      <button 
-        onClick={() => navigate('/login')} 
+      <button
+        onClick={() => navigate('/login')}
         className="absolute top-6 left-6 z-20 flex items-center gap-2 text-[var(--muted)] hover:text-[var(--ink)] transition-colors font-medium cursor-pointer"
       >
         <ArrowLeft className="w-5 h-5" /> Back to Login
       </button>
-      
+
       <div className="flex-1 flex flex-col py-12 px-4 sm:px-6 lg:flex-none lg:px-20 xl:px-24 h-full overflow-y-auto">
         <div className="mx-auto my-auto w-full max-w-sm lg:w-96">
           <div className="flex items-center gap-3">

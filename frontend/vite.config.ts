@@ -11,6 +11,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, repoRoot, '');
   const apiPort = env.PORT || process.env.PORT || '3000';
+  const vitePort = Number(process.env.VITE_PORT || env.VITE_PORT) || 5174;
   const apiProxyTarget = process.env.API_PROXY_TARGET || env.VITE_API_PROXY_TARGET || `http://localhost:${apiPort}`;
 
   return {
@@ -19,7 +20,15 @@ export default defineConfig(({ mode }) => {
     envDir: repoRoot,
     assetsInclude: ['**/*.docx'],
     server: {
-      port: Number(process.env.VITE_PORT || env.VITE_PORT) || 5174,
+      host: true,
+      port: vitePort,
+      strictPort: true,
+      hmr: {
+        protocol: 'ws',
+        host: 'localhost',
+        port: vitePort,
+        clientPort: vitePort,
+      },
       proxy: {
         '/api': {
           target: apiProxyTarget,
