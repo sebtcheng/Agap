@@ -18,6 +18,7 @@ import { ApplicantProfileService } from '../features/applicant-profile/applicant
  */
 const RECLASS_GC_FULL = `(
   SELECT rg.*,
+         rg.initial_reclass_psi_cd AS item_no,
          gi.first_name AS first_name,
          gi.last_name AS last_name,
          ir.region AS region,
@@ -25,7 +26,7 @@ const RECLASS_GC_FULL = `(
          ir.reclass_position AS reclass_position
   FROM reclass_gc rg
   LEFT JOIN gmis_gc_items gi ON gi.id = rg.gmis_id
-  LEFT JOIN ref.initial_reclass ir ON ir.psi_cd = rg.item_no
+  LEFT JOIN ref.initial_reclass ir ON ir.psi_cd = rg.initial_reclass_psi_cd
 )`;
 
 export interface ReclassRegisterDto {
@@ -255,17 +256,21 @@ class ApplicantsServiceClass {
 
     let plantillaToEnsure = applicant.plantilla_item_number;
     if (!plantillaToEnsure && applicant.surname && applicant.first_name) {
-      const incRes = await pool.query(
-        `SELECT item_no FROM ${RECLASS_GC_FULL} reclass_gc WHERE UPPER(TRIM(last_name)) = UPPER(TRIM($1)) AND UPPER(TRIM(first_name)) = UPPER(TRIM($2)) LIMIT 1`,
-        [applicant.surname, applicant.first_name],
-      );
-      if (incRes.rows.length > 0 && incRes.rows[0].item_no) {
-        plantillaToEnsure = incRes.rows[0].item_no;
-        await pool.query(
-          `UPDATE applicants SET plantilla_item_number = $1 WHERE id = $2`,
-          [plantillaToEnsure, applicant.id],
+      try {
+        const incRes = await pool.query(
+          `SELECT item_no FROM ${RECLASS_GC_FULL} reclass_gc WHERE UPPER(TRIM(last_name)) = UPPER(TRIM($1)) AND UPPER(TRIM(first_name)) = UPPER(TRIM($2)) LIMIT 1`,
+          [applicant.surname, applicant.first_name],
         );
-        applicant.plantilla_item_number = plantillaToEnsure;
+        if (incRes.rows.length > 0 && incRes.rows[0].item_no) {
+          plantillaToEnsure = incRes.rows[0].item_no;
+          await pool.query(
+            `UPDATE applicants SET plantilla_item_number = $1 WHERE id = $2`,
+            [plantillaToEnsure, applicant.id],
+          );
+          applicant.plantilla_item_number = plantillaToEnsure;
+        }
+      } catch (err) {
+        console.warn('Non-fatal plantilla lookup error during login:', err);
       }
     }
     return applicant;

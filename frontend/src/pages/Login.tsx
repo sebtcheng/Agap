@@ -821,7 +821,14 @@ export default function Login() {
         localStorage.setItem('session_data', JSON.stringify(sessionItem));
         navigate('/applicant-dashboard');
       } else {
-        Swal.fire('Error', 'Invalid credentials', 'error');
+        const errData = await response.json().catch(() => ({}));
+        Swal.fire(
+          'Error',
+          response.status === 401
+            ? 'Invalid credentials'
+            : errData.message || 'Unable to sign in right now. Please try again.',
+          'error',
+        );
       }
     } catch (err) {
       console.error(err);
