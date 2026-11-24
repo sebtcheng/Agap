@@ -2235,6 +2235,18 @@ export default function Login() {
                     </div>
                   </div>
 
+                  <div className="flex items-center justify-end pt-0.5">
+                    <div className="text-sm">
+                      <a
+                        href="#"
+                        onClick={handleForgotPassword}
+                        className="font-semibold text-[#0A6FA6] hover:text-[#065078] hover:underline transition-colors"
+                      >
+                        Forgot your password?
+                      </a>
+                    </div>
+                  </div>
+
                   <div id="tour-login-submit" className="pt-2">
                     <button
                       type="submit"
