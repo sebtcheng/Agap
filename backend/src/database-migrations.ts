@@ -302,55 +302,6 @@ export async function runSchemaMigrations(client: any) {
       END $$;
     `);
 
-    // Ensure gmis_gc_items table exists matching GMIS production schema
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS gmis_gc_items (
-        id SERIAL PRIMARY KEY,
-        uacs_fpap_dsc VARCHAR(255),
-        org_cd REAL,
-        org_dsc VARCHAR(255),
-        uacs_oper_dsc VARCHAR(255),
-        division VARCHAR(255),
-        region VARCHAR(255),
-        step_inc INTEGER,
-        pop_dsc VARCHAR(255),
-        pos_dsc VARCHAR(255),
-        sal_grd INTEGER,
-        psi_cd VARCHAR(150),
-        last_name VARCHAR(150),
-        first_name VARCHAR(150),
-        mid_name VARCHAR(150),
-        f_pos VARCHAR(150),
-        pos_cat VARCHAR(150),
-        yr_crtd INTEGER,
-        item_no VARCHAR(150),
-        current_position VARCHAR(255),
-        school_id VARCHAR(50),
-        school_name VARCHAR(255),
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS region VARCHAR(255);
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS division VARCHAR(255);
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT FALSE;
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS email VARCHAR(255);
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS password VARCHAR(255);
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
-      ALTER TABLE gmis_gc_items ADD COLUMN IF NOT EXISTS passcode VARCHAR(255);
-      ALTER TABLE gmis_gc_items ALTER COLUMN email DROP NOT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN password DROP NOT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN password_hash DROP NOT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN passcode DROP NOT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN email SET DEFAULT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN password SET DEFAULT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN password_hash SET DEFAULT NULL;
-      ALTER TABLE gmis_gc_items ALTER COLUMN passcode SET DEFAULT NULL;
-      CREATE INDEX IF NOT EXISTS idx_gmis_gc_items_psi_cd ON gmis_gc_items(psi_cd);
-      CREATE INDEX IF NOT EXISTS idx_gmis_gc_items_region ON gmis_gc_items(region);
-      CREATE INDEX IF NOT EXISTS idx_gmis_gc_items_division ON gmis_gc_items(division);
-      CREATE INDEX IF NOT EXISTS idx_gmis_gc_items_is_test ON gmis_gc_items(is_test);
-    `);
-
     // Ensure agap_invited table exists
     await client.query(`
       CREATE TABLE IF NOT EXISTS agap_invited (

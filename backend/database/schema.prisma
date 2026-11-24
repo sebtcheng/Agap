@@ -4145,41 +4145,6 @@ model reclass_gc {
   @@index([current_stage])
 }
 
-model gmis_gc_items {
-  id               Int       @id @default(autoincrement())
-  uacs_fpap_dsc    String?   @db.VarChar(255)
-  org_cd           Float?
-  org_dsc          String?   @db.VarChar(255)
-  uacs_oper_dsc    String?   @db.VarChar(255)
-  division         String?   @db.VarChar(255)
-  region           String?   @db.VarChar(255)
-  step_inc         Int?
-  pop_dsc          String?   @db.VarChar(255)
-  pos_dsc          String?   @db.VarChar(255)
-  sal_grd          Int?
-  psi_cd           String?   @db.VarChar(150)
-  last_name        String?   @db.VarChar(150)
-  first_name       String?   @db.VarChar(150)
-  mid_name         String?   @db.VarChar(150)
-  f_pos            String?   @db.VarChar(150)
-  pos_cat          String?   @db.VarChar(150)
-  yr_crtd          Int?
-  item_no          String?   @db.VarChar(150)
-  current_position String?   @db.VarChar(255)
-  school_id        String?   @db.VarChar(50)
-  school_name      String?   @db.VarChar(255)
-  email            String?   @db.VarChar(255)
-  password         String?   @db.VarChar(255)
-  password_hash    String?   @db.VarChar(255)
-  passcode         String?   @db.VarChar(255)
-  created_at       DateTime? @default(now()) @db.Timestamptz(6)
-  updated_at       DateTime? @default(now()) @db.Timestamptz(6)
-
-  @@index([psi_cd])
-  @@index([region])
-  @@index([division])
-}
-
 model reclass_documents {
   id                     Int       @id @default(autoincrement())
   reclass_application_id Int?
