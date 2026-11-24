@@ -7,6 +7,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 5050,
+        VITE_BASE_PATH: '/insighted/AGAP-staging/',
       },
       instances: 1,
       exec_mode: 'fork',

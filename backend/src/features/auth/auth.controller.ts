@@ -286,15 +286,29 @@ export async function forgotPassword(req: Request, res: Response) {
     return res.status(400).json({ message: 'Email is required' });
   }
   try {
-    let origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
-    if (!origin && typeof req.headers.referer === 'string') {
+    const headerOrigin =
+      typeof req.headers.origin === 'string' ? req.headers.origin.trim() : undefined;
+    let frontendBaseUrl: string | undefined;
+    if (typeof req.headers.referer === 'string') {
       try {
-        origin = new URL(req.headers.referer).origin;
+        const refUrl = new URL(req.headers.referer);
+        if (!headerOrigin || refUrl.origin === headerOrigin) {
+          const basePath = refUrl.pathname
+            .replace(
+              /\/(?:login|applicant-login|reset-password|apply|applicant-dashboard|applicant-jobs)(?:\/.*)?$/i,
+              '',
+            )
+            .replace(/\/+$/, '');
+          frontendBaseUrl = `${refUrl.origin}${basePath}`;
+        }
       } catch {
-        origin = undefined;
+        frontendBaseUrl = undefined;
       }
     }
-    const sent = await AuthService.forgotPassword(String(email).trim(), origin);
+    if (!frontendBaseUrl && headerOrigin) {
+      frontendBaseUrl = headerOrigin;
+    }
+    const sent = await AuthService.forgotPassword(String(email).trim(), frontendBaseUrl);
     if (!sent) {
       return res.status(404).json({
         success: false,

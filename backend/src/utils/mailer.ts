@@ -18,15 +18,29 @@ export const sendPasswordResetEmail = async (
   frontendOrigin?: string,
 ) => {
   const vitePort = process.env.VITE_PORT || '5174';
+  const apiUrlFallback =
+    process.env.VITE_API_URL && /^https?:\/\//i.test(process.env.VITE_API_URL)
+      ? process.env.VITE_API_URL
+      : '';
   const rawUrl =
     frontendOrigin ||
     process.env.FRONTEND_URL ||
-    process.env.VITE_API_URL ||
+    apiUrlFallback ||
     `http://localhost:${vitePort}`;
   const frontendUrl = rawUrl.replace(/\/+$/, '');
-  const basePath = (process.env.VITE_BASE_PATH || '').replace(/\/+$/, '');
-  const normalizedBase = basePath && basePath !== '/' ? basePath : '';
-  const resetLink = `${frontendUrl}${normalizedBase}/reset-password?token=${token}`;
+  const rawBasePath = (process.env.VITE_BASE_PATH || '')
+    .trim()
+    .replace(/\/+$/, '');
+  const normalizedBase =
+    rawBasePath && rawBasePath !== '/'
+      ? rawBasePath.startsWith('/')
+        ? rawBasePath
+        : `/${rawBasePath}`
+      : '';
+  const alreadyHasBase =
+    normalizedBase !== '' &&
+    frontendUrl.toLowerCase().endsWith(normalizedBase.toLowerCase());
+  const resetLink = `${frontendUrl}${alreadyHasBase ? '' : normalizedBase}/reset-password?token=${token}`;
 
   const mailOptions = {
     from: `"AGAP Portal" <${process.env.EMAIL_USER}>`,
