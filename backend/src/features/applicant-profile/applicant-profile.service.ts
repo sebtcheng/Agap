@@ -345,10 +345,25 @@ class ApplicantProfileServiceClass {
       throw new Error('Incorrect current password');
     }
     const newPasswordHash = await bcrypt.hash(newPasswordRaw, 10);
-    await pool.query('UPDATE applicants SET password_hash = $1 WHERE id = $2', [
-      newPasswordHash,
-      applicantId,
-    ]);
+    const updated = await pool.query(
+      'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING email_address, email, plantilla_item_number',
+      [newPasswordHash, applicantId],
+    );
+    const row = updated.rows[0];
+    if (row) {
+      await pool.query(
+        `UPDATE reclass_gc SET password_hash = $1, updated_at = NOW()
+         WHERE ($2 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($2)))
+            OR ($3 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($3)))
+            OR ($4 <> '' AND UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($4)))`,
+        [
+          newPasswordHash,
+          String(row.email_address || '').trim(),
+          String(row.email || '').trim(),
+          String(row.plantilla_item_number || '').trim(),
+        ],
+      );
+    }
     return true;
   }
 
@@ -619,15 +634,18 @@ class ApplicantProfileServiceClass {
       [cleanEmail],
     );
     if (result.rows.length === 0) {
+      console.warn(
+        `⚠️ Password reset requested for unregistered email (not found in applicants): ${cleanEmail}`,
+      );
       return false;
     }
 
     const applicantId = result.rows[0].id;
-    const targetEmail = result.rows[0].target_email || cleanEmail;
     const secret = process.env.JWT_SECRET || 'fallback_secret';
     const token = jwt.sign({ applicantId }, secret, { expiresIn: '1h' });
 
-    await sendPasswordResetEmail(targetEmail, token, frontendOrigin);
+    console.log(`📧 Sending password reset email to ${cleanEmail} (applicant #${applicantId})...`);
+    await sendPasswordResetEmail(cleanEmail, token, frontendOrigin);
     return true;
   }
 
@@ -644,13 +662,27 @@ class ApplicantProfileServiceClass {
       const passwordHash = await bcrypt.hash(newPassword, salt);
 
       const result = await pool.query(
-        'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+        'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email_address, email, plantilla_item_number',
         [passwordHash, applicantId],
       );
 
       if (result.rows.length === 0) {
         throw new Error('Applicant not found');
       }
+
+      const row = result.rows[0];
+      await pool.query(
+        `UPDATE reclass_gc SET password_hash = $1, updated_at = NOW()
+         WHERE ($2 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($2)))
+            OR ($3 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($3)))
+            OR ($4 <> '' AND UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($4)))`,
+        [
+          passwordHash,
+          String(row.email_address || '').trim(),
+          String(row.email || '').trim(),
+          String(row.plantilla_item_number || '').trim(),
+        ],
+      );
       return true;
     } catch (error) {
       throw new Error('Invalid or expired token');

@@ -294,12 +294,17 @@ export async function forgotPassword(req: Request, res: Response) {
         origin = undefined;
       }
     }
-    // Always return success even if email is not found to prevent enumeration
-    await AuthService.forgotPassword(String(email).trim(), origin);
+    const sent = await AuthService.forgotPassword(String(email).trim(), origin);
+    if (!sent) {
+      return res.status(404).json({
+        success: false,
+        message:
+          'No account found with that email address. Please check your email or register first.',
+      });
+    }
     res.json({
       success: true,
-      message:
-        'If that email is registered, a password reset link has been sent.',
+      message: 'A password reset link has been sent to your email address.',
     });
   } catch (error: any) {
     console.error('Error in forgot-password:', error);
