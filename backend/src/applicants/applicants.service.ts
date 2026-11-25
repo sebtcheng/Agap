@@ -216,6 +216,9 @@ class ApplicantsServiceClass {
     password_raw: string,
     loginMethod?: string,
   ) {
+    const cleanIdentifier = String(email_address || '').trim();
+    if (!cleanIdentifier || !password_raw) return null;
+
     const result = await pool.query(
       `SELECT * FROM applicants 
        WHERE LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1)) 
@@ -223,13 +226,47 @@ class ApplicantsServiceClass {
           OR LOWER(TRIM(COALESCE(alternate_email, ''))) = LOWER(TRIM($1))
           OR UPPER(TRIM(COALESCE(plantilla_item_number, ''))) = UPPER(TRIM($1))
        ORDER BY updated_at DESC NULLS LAST, id DESC`,
-      [email_address],
+      [cleanIdentifier],
     );
-    if (!result.rows || result.rows.length === 0) return null;
+    const allApplicantRows = result.rows || [];
+    const jobseekerRows = allApplicantRows.filter(
+      (row: any) =>
+        String(row?.registrant_type || 'jobseeker')
+          .trim()
+          .toLowerCase() !== 'reclass',
+    );
+    const hasReclassApplicantRow = allApplicantRows.length > jobseekerRows.length;
+
+    if (jobseekerRows.length === 0) {
+      let existsInReclass = hasReclassApplicantRow;
+      if (!existsInReclass) {
+        const reclassCheck = await pool.query(
+          `SELECT id FROM reclass_gc
+           WHERE LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
+              OR UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
+              OR UPPER(TRIM(COALESCE(new_item_no, ''))) = UPPER(TRIM($1))
+           LIMIT 1`,
+          [cleanIdentifier],
+        );
+        existsInReclass = Boolean(
+          reclassCheck.rows && reclassCheck.rows.length > 0,
+        );
+      }
+      if (existsInReclass) {
+        const wrongPortalError: any = new Error(
+          'This account is registered in the Reclassification Portal. Please log in to the Reclassification Portal.',
+        );
+        wrongPortalError.statusCode = 403;
+        wrongPortalError.code = 'WRONG_PORTAL';
+        wrongPortalError.correctPortal = 'reclass';
+        throw wrongPortalError;
+      }
+      return null;
+    }
 
     let matchedApplicant: any = null;
 
-    for (const app of result.rows) {
+    for (const app of jobseekerRows) {
       let isMatch = false;
       if (loginMethod === 'passcode') {
         if (app.passcode && app.passcode === password_raw) {
@@ -1987,155 +2024,123 @@ class ApplicantsServiceClass {
       return null;
     }
 
-    let appRes = await pool.query(
-      `SELECT * FROM applicants 
-       WHERE LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1)) 
-          OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
-          OR UPPER(TRIM(COALESCE(plantilla_item_number, ''))) = UPPER(TRIM($1))
-       ORDER BY updated_at DESC NULLS LAST, id DESC`,
+    // Authenticate exclusively against reclass_gc (never fall back to applicants).
+    const gcRes = await pool.query(
+      `SELECT g.*, ir.incumbent, ir.region AS ir_region, ir.division AS ir_division,
+              ir.pos_dsc AS ir_pos_dsc, ir.reclass_position AS ir_reclass_position
+       FROM reclass_gc g
+       LEFT JOIN ref.initial_reclass ir
+         ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, '')))
+       WHERE LOWER(TRIM(COALESCE(g.email, ''))) = LOWER(TRIM($1))
+          OR UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
+          OR UPPER(TRIM(COALESCE(g.new_item_no, ''))) = UPPER(TRIM($1))
+       ORDER BY g.updated_at DESC NULLS LAST, g.id DESC`,
       [cleanIdentifier],
     );
 
-    let applicant: any = null;
-
-    if (appRes.rows && appRes.rows.length > 0) {
-      for (const app of appRes.rows) {
-        let isMatch = false;
-        if (method === 'passcode') {
-          if (app.passcode_hash) {
-            isMatch = await bcrypt.compare(credential, app.passcode_hash);
-          } else if (app.passcode) {
-            if (app.passcode.startsWith('$2')) {
-              isMatch = await bcrypt.compare(credential, app.passcode);
-            } else {
-              isMatch = app.passcode === credential;
-            }
-          }
-        } else {
-          if (app.password_hash) {
-            isMatch = await bcrypt.compare(credential, app.password_hash);
-          } else if (app.password) {
-            isMatch = app.password === credential;
-          }
-        }
-
-        if (isMatch) {
-          applicant = app;
-          break;
-        }
-      }
-    }
-
-    if (!applicant) {
-      // Fallback: check if record exists in reclass_gc directly
-      const gcRes = await pool.query(
-        `SELECT g.*, ir.incumbent, ir.region AS ir_region, ir.division AS ir_division, ir.pos_dsc AS ir_pos_dsc
-         FROM reclass_gc g
-         LEFT JOIN ref.initial_reclass ir
-           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, '')))
-         WHERE LOWER(TRIM(COALESCE(g.email, ''))) = LOWER(TRIM($1)) 
-            OR UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
+    if (!gcRes.rows || gcRes.rows.length === 0) {
+      const applicantCheck = await pool.query(
+        `SELECT id FROM applicants
+         WHERE LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($1))
+            OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
+            OR LOWER(TRIM(COALESCE(alternate_email, ''))) = LOWER(TRIM($1))
+            OR UPPER(TRIM(COALESCE(plantilla_item_number, ''))) = UPPER(TRIM($1))
          LIMIT 1`,
         [cleanIdentifier],
       );
-      if (gcRes.rows.length > 0) {
-        const gc = gcRes.rows[0];
-        let isGcMatch = false;
-        if (method === 'passcode') {
-          if (gc.passcode) {
-            if (gc.passcode.startsWith('$2')) {
-              isGcMatch = await bcrypt.compare(credential, gc.passcode);
-            } else {
-              isGcMatch = gc.passcode === credential;
-            }
-          }
-        } else {
-          if (gc.password_hash) {
-            isGcMatch = await bcrypt.compare(credential, gc.password_hash);
-          }
-        }
-
-        if (isGcMatch) {
-          // Link / create applicant for this session
-          const parsedGcName = this.parseIncumbentName(gc.incumbent);
-          const client = await pool.connect();
-          try {
-            await client.query('BEGIN');
-            const newApplicantNumber = `AGAP-${Date.now().toString().slice(-4)}`;
-            const insertApp = await client.query(
-              `INSERT INTO applicants (
-                applicant_number, surname, first_name, email_address, email,
-                password_hash, passcode_hash, passcode, mobile_number,
-                registrant_type, plantilla_item_number, current_designation,
-                region, division, is_test, created_at, updated_at
-              ) VALUES (
-                $1, $2, $3, $4, $4,
-                $5, $6, $7, $8,
-                'reclass', $9, $10,
-                $11, $12, false, NOW(), NOW()
-              ) RETURNING *`,
-              [
-                newApplicantNumber,
-                parsedGcName.lastName || '',
-                parsedGcName.firstName || '',
-                gc.email || `${cleanIdentifier.toLowerCase()}@deped.gov.ph`,
-                gc.password_hash,
-                gc.passcode
-                  ? (gc.passcode.startsWith('$2')
-                    ? gc.passcode
-                    : await bcrypt.hash(gc.passcode, 10))
-                  : null,
-                gc.passcode,
-                gc.mobile_number,
-                gc.initial_reclass_psi_cd,
-                gc.current_position || gc.ir_pos_dsc || 'Guidance Counselor',
-                gc.ir_region || null,
-                gc.ir_division || null,
-              ],
-            );
-            applicant = insertApp.rows[0];
-            await client.query('COMMIT');
-          } catch {
-            await client.query('ROLLBACK');
-          } finally {
-            client.release();
-          }
-        }
+      if (applicantCheck.rows && applicantCheck.rows.length > 0) {
+        const wrongPortalError: any = new Error(
+          'This account is registered in the Jobseeker Portal. Please log in to the Jobseeker Portal.',
+        );
+        wrongPortalError.statusCode = 403;
+        wrongPortalError.code = 'WRONG_PORTAL';
+        wrongPortalError.correctPortal = 'jobseeker';
+        throw wrongPortalError;
       }
-    }
-
-    if (!applicant) {
       return null;
     }
 
-    // Query incumbent and reclass details
-    let incumbent: any = null;
-    if (applicant.plantilla_item_number) {
-      const incRes = await pool.query(
-        `SELECT g.*, ir.incumbent, ir.region AS ir_region, ir.division AS ir_division,
-                ir.pos_dsc AS ir_pos_dsc, ir.reclass_position AS ir_reclass_position
-         FROM reclass_gc g
-         LEFT JOIN ref.initial_reclass ir
-           ON UPPER(TRIM(COALESCE(ir.psi_cd, ''))) = UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, '')))
-         WHERE UPPER(TRIM(COALESCE(g.initial_reclass_psi_cd, ''))) = UPPER(TRIM($1))
-            OR UPPER(TRIM(COALESCE(g.new_item_no, ''))) = UPPER(TRIM($1))
-         LIMIT 1`,
-        [applicant.plantilla_item_number],
-      );
-      if (incRes.rows.length > 0) {
-        incumbent = incRes.rows[0];
+    let matchedGc: any = null;
+    for (const gc of gcRes.rows) {
+      let isGcMatch = false;
+      if (method === 'passcode') {
+        if (gc.passcode) {
+          if (String(gc.passcode).startsWith('$2')) {
+            isGcMatch = await bcrypt.compare(credential, gc.passcode);
+          } else {
+            isGcMatch = gc.passcode === credential;
+          }
+        }
+      } else {
+        if (gc.password_hash) {
+          isGcMatch = await bcrypt.compare(credential, gc.password_hash);
+        } else if (gc.password) {
+          if (String(gc.password).startsWith('$2')) {
+            isGcMatch = await bcrypt.compare(credential, gc.password);
+          } else {
+            isGcMatch = gc.password === credential;
+          }
+        }
+      }
+
+      if (isGcMatch) {
+        matchedGc = gc;
+        break;
       }
     }
 
-    const reclassApp = incumbent || null;
+    if (!matchedGc) {
+      return null;
+    }
+
+    // Read-only lookup for an existing applicant profile row (for dashboard metadata only).
+    const plantillaCode = String(
+      matchedGc.initial_reclass_psi_cd || matchedGc.new_item_no || '',
+    ).trim();
+    const gcEmail = String(matchedGc.email || '').trim();
+    let applicant: any = null;
+    if (plantillaCode || gcEmail) {
+      const linkedAppRes = await pool.query(
+        `SELECT id, applicant_number, first_name, middle_name, surname, email_address,
+                plantilla_item_number, current_designation, region, division
+         FROM applicants
+         WHERE ($1 <> '' AND UPPER(TRIM(COALESCE(plantilla_item_number, ''))) = UPPER(TRIM($1)))
+            OR ($2 <> '' AND (LOWER(TRIM(COALESCE(email_address, ''))) = LOWER(TRIM($2))
+                          OR LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($2))))
+         ORDER BY updated_at DESC NULLS LAST, id DESC
+         LIMIT 1`,
+        [plantillaCode, gcEmail],
+      );
+      if (linkedAppRes.rows && linkedAppRes.rows.length > 0) {
+        applicant = linkedAppRes.rows[0];
+      }
+    }
+
+    const parsedGcName = this.parseIncumbentName(matchedGc.incumbent);
+    const sessionApplicant = applicant || {
+      id: matchedGc.id,
+      applicant_number: plantillaCode || `RECLASS-${matchedGc.id}`,
+      first_name: parsedGcName.firstName || matchedGc.first_name || '',
+      middle_name: null,
+      surname: parsedGcName.lastName || matchedGc.last_name || '',
+      email_address: gcEmail || `${cleanIdentifier.toLowerCase()}@deped.gov.ph`,
+      plantilla_item_number: plantillaCode || null,
+      current_designation:
+        matchedGc.current_position || matchedGc.ir_pos_dsc || 'Guidance Counselor',
+      region: matchedGc.region || matchedGc.ir_region || null,
+      division: matchedGc.division || matchedGc.ir_division || null,
+    };
+
+    const incumbent = matchedGc;
+    const reclassApp = incumbent;
 
     const secret = process.env.JWT_SECRET || 'fallback_secret';
     const token = jwt.sign(
       {
-        id: applicant.id,
-        uid: applicant.id,
-        applicant_number: applicant.applicant_number,
-        email: applicant.email_address,
+        id: sessionApplicant.id,
+        uid: sessionApplicant.id,
+        applicant_number: sessionApplicant.applicant_number,
+        email: sessionApplicant.email_address,
         role: 'reclass',
         registrant_type: 'reclass',
       },
@@ -2144,7 +2149,11 @@ class ApplicantsServiceClass {
     );
 
     const resolvedFullName =
-      [applicant.first_name, applicant.middle_name, applicant.surname]
+      [
+        sessionApplicant.first_name,
+        sessionApplicant.middle_name,
+        sessionApplicant.surname,
+      ]
         .filter(Boolean)
         .join(' ') ||
       (incumbent?.first_name
@@ -2152,19 +2161,20 @@ class ApplicantsServiceClass {
         : 'Applicant');
 
     const user = {
-      id: applicant.id,
-      applicant_number: applicant.applicant_number,
-      first_name: applicant.first_name,
-      middle_name: applicant.middle_name,
-      surname: applicant.surname,
+      id: sessionApplicant.id,
+      applicant_number: sessionApplicant.applicant_number,
+      first_name: sessionApplicant.first_name,
+      middle_name: sessionApplicant.middle_name,
+      surname: sessionApplicant.surname,
       full_name: resolvedFullName,
-      email: applicant.email_address,
+      email: sessionApplicant.email_address,
       registrant_type: 'reclass',
-      plantilla_item_number: applicant.plantilla_item_number,
+      plantilla_item_number:
+        sessionApplicant.plantilla_item_number || plantillaCode || null,
       current_position:
         incumbent?.current_position ||
         incumbent?.ir_pos_dsc ||
-        applicant.current_designation ||
+        sessionApplicant.current_designation ||
         'Guidance Counselor',
       target_position:
         incumbent?.target_position ||
@@ -2177,8 +2187,16 @@ class ApplicantsServiceClass {
         reclassApp?.reclass_position ||
         incumbent?.ir_reclass_position ||
         null,
-      region: incumbent?.region || incumbent?.ir_region || applicant.region || null,
-      division: incumbent?.division || incumbent?.ir_division || applicant.division || null,
+      region:
+        incumbent?.region ||
+        incumbent?.ir_region ||
+        sessionApplicant.region ||
+        null,
+      division:
+        incumbent?.division ||
+        incumbent?.ir_division ||
+        sessionApplicant.division ||
+        null,
       school_name: incumbent?.school_name || null,
       application_number:
         incumbent?.school_name || incumbent?.application_number || null,
@@ -2188,7 +2206,7 @@ class ApplicantsServiceClass {
 
     return {
       token,
-      applicant,
+      applicant: sessionApplicant,
       user,
     };
   }

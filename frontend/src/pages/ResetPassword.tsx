@@ -10,6 +10,10 @@ export default function ResetPassword() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const token = searchParams.get('token');
+  const rawPortal = searchParams.get('portal');
+  const portal: 'jobseeker' | 'reclass' | null =
+    rawPortal === 'jobseeker' || rawPortal === 'reclass' ? rawPortal : null;
+  const loginRedirectPath = portal ? `/login?type=${portal}` : '/login';
 
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -18,15 +22,19 @@ export default function ResetPassword() {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (!token) {
-      Swal.fire('Invalid Link', 'No reset token found in the URL.', 'error').then(() => {
+    if (!token || !portal) {
+      Swal.fire('Invalid Link', 'No valid reset token or portal context found in the URL.', 'error').then(() => {
         navigate('/login');
       });
     }
-  }, [token, navigate]);
+  }, [token, portal, navigate]);
 
   const handleReset = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!token || !portal) {
+      Swal.fire('Invalid Link', 'No valid reset token or portal context found in the URL.', 'error');
+      return;
+    }
     if (password !== confirmPassword) {
       Swal.fire('Error', 'Passwords do not match.', 'error');
       return;
@@ -42,12 +50,12 @@ export default function ResetPassword() {
       const response = await fetch(`${API_BASE_URL}/api/applicants/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, new_password: password })
+        body: JSON.stringify({ token, new_password: password, portal })
       });
       const data = await response.json();
       if (response.ok) {
         Swal.fire('Success', 'Your password has been successfully reset. You can now login.', 'success').then(() => {
-          navigate('/login');
+          navigate(loginRedirectPath);
         });
       } else {
         Swal.fire('Error', data.message || 'Failed to reset password. The link may have expired.', 'error');
@@ -63,7 +71,7 @@ export default function ResetPassword() {
     <div className="h-screen flex bg-[var(--bg-2)] relative overflow-hidden" style={{ fontFamily: 'var(--font-body)' }}>
       {/* Back Button */}
       <button
-        onClick={() => navigate('/login')}
+        onClick={() => navigate(loginRedirectPath)}
         className="absolute top-6 left-6 z-20 flex items-center gap-2 text-[var(--muted)] hover:text-[var(--ink)] transition-colors font-medium cursor-pointer"
       >
         <ArrowLeft className="w-5 h-5" /> Back to Login
@@ -142,7 +150,7 @@ export default function ResetPassword() {
               <div>
                 <button
                   type="submit"
-                  disabled={loading || !token}
+                  disabled={loading || !token || !portal}
                   className="w-full flex justify-center items-center gap-2 py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-bold text-white bg-[#022851] hover:bg-[#021f3f] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#022851] transition-colors"
                 >
                   <Lock className="w-4 h-4" />

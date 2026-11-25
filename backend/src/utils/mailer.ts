@@ -16,6 +16,7 @@ export const sendPasswordResetEmail = async (
   email: string,
   token: string,
   frontendOrigin?: string,
+  portal?: 'jobseeker' | 'reclass',
 ) => {
   const vitePort = process.env.VITE_PORT || '5174';
   const apiUrlFallback =
@@ -40,7 +41,14 @@ export const sendPasswordResetEmail = async (
   const alreadyHasBase =
     normalizedBase !== '' &&
     frontendUrl.toLowerCase().endsWith(normalizedBase.toLowerCase());
-  const resetLink = `${frontendUrl}${alreadyHasBase ? '' : normalizedBase}/reset-password?token=${token}`;
+  const portalQuery = portal ? `&portal=${encodeURIComponent(portal)}` : '';
+  const resetLink = `${frontendUrl}${alreadyHasBase ? '' : normalizedBase}/reset-password?token=${encodeURIComponent(token)}${portalQuery}`;
+  const portalLabel =
+    portal === 'reclass'
+      ? 'AGAP Reclassification Portal'
+      : portal === 'jobseeker'
+        ? 'AGAP Jobseeker Portal'
+        : 'AGAP Portal';
 
   const mailOptions = {
     from: `"AGAP Portal" <${process.env.EMAIL_USER}>`,
@@ -49,7 +57,7 @@ export const sendPasswordResetEmail = async (
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
         <h2>Password Reset Request</h2>
-        <p>You recently requested to reset your password for your AGAP Portal account.</p>
+        <p>You recently requested to reset your password for your ${portalLabel} account.</p>
         <p>Click the button below to reset it. This link is valid for 1 hour.</p>
         <a href="${resetLink}" style="display: inline-block; padding: 10px 20px; margin: 20px 0; background-color: #022851; color: #ffffff; text-decoration: none; border-radius: 5px;">
           Reset Password

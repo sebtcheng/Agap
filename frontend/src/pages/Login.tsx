@@ -43,6 +43,8 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loginMethod, setLoginMethod] = useState<'password' | 'passcode'>('password');
+  const [jobseekerLoginError, setJobseekerLoginError] = useState<string | null>(null);
+  const [jobseekerCorrectPortal, setJobseekerCorrectPortal] = useState<'jobseeker' | 'reclass' | null>(null);
 
   // Jobseeker Registration state
   const [isRegistering, setIsRegistering] = useState(false);
@@ -60,6 +62,7 @@ export default function Login() {
   const [showReclassPassword, setShowReclassPassword] = useState(false);
   const [reclassLoginMethod, setReclassLoginMethod] = useState<'password' | 'passcode'>('password');
   const [reclassLoginError, setReclassLoginError] = useState<string | null>(null);
+  const [reclassCorrectPortal, setReclassCorrectPortal] = useState<'jobseeker' | 'reclass' | null>(null);
 
   // Reclassification Registration state (Inline)
   const [stepAPlantilla, setStepAPlantilla] = useState('');
@@ -268,6 +271,10 @@ export default function Login() {
   }, [tourActive, tourIndex, tourMode, reclassView, newAppStep]);
 
   useEffect(() => {
+    setReclassLoginError(null);
+    setReclassCorrectPortal(null);
+    setJobseekerLoginError(null);
+    setJobseekerCorrectPortal(null);
     if (typeParam === 'reclass') {
       setPortalType('reclass');
       if (searchParams.get('view') === 'register') {
@@ -281,6 +288,19 @@ export default function Login() {
       setShowWelcomeModal(true);
     }
   }, [typeParam, searchParams]);
+
+  const handleSwitchToPortal = (targetPortal: 'jobseeker' | 'reclass') => {
+    setReclassLoginError(null);
+    setReclassCorrectPortal(null);
+    setJobseekerLoginError(null);
+    setJobseekerCorrectPortal(null);
+    setIsRegistering(false);
+    setReclassView('login');
+    setPortalType(targetPortal);
+    navigate(targetPortal === 'reclass' ? '/login?type=reclass' : '/login?type=jobseeker', {
+      replace: true,
+    });
+  };
 
   useEffect(() => {
     const sessionStr = localStorage.getItem('session_data');
@@ -332,6 +352,7 @@ export default function Login() {
   const handleReclassLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setReclassLoginError(null);
+    setReclassCorrectPortal(null);
 
     const cleanEmail = reclassEmail.trim();
     if (!cleanEmail) {
@@ -359,6 +380,7 @@ export default function Login() {
           loginMethod: reclassLoginMethod,
           password: reclassLoginMethod === 'password' ? reclassPassword : undefined,
           passcode: reclassLoginMethod === 'passcode' ? reclassPasscode.trim() : undefined,
+          portal: 'reclass',
         }),
       });
 
@@ -384,8 +406,13 @@ export default function Login() {
       } else {
         if (response.status === 429) {
           setReclassLoginError(resData.message || 'Account temporarily locked out. Please try again later.');
+        } else if (response.status === 403 && resData.message) {
+          setReclassLoginError(resData.message);
+          if (resData.correctPortal === 'jobseeker' || resData.correctPortal === 'reclass') {
+            setReclassCorrectPortal(resData.correctPortal);
+          }
         } else {
-          setReclassLoginError('Invalid credentials. Please check your email/item number and password or passcode.');
+          setReclassLoginError(resData.message || 'Invalid credentials. Please check your email/item number and password or passcode.');
         }
       }
     } catch (err) {
@@ -793,6 +820,8 @@ export default function Login() {
   // Jobseeker login
   const handleJobseekerLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setJobseekerLoginError(null);
+    setJobseekerCorrectPortal(null);
     if (!email.trim() || !password) {
       Swal.fire('Required', 'Please enter your username/email and password.', 'warning');
       return;
@@ -803,7 +832,7 @@ export default function Login() {
       const response = await fetch(`${API_BASE_URL}/api/applicants/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email_address: email, password, loginMethod }),
+        body: JSON.stringify({ email_address: email, password, loginMethod, portal: 'jobseeker' }),
       });
 
       if (response.ok) {
@@ -822,13 +851,21 @@ export default function Login() {
         navigate('/applicant-dashboard');
       } else {
         const errData = await response.json().catch(() => ({}));
-        Swal.fire(
-          'Error',
-          response.status === 401
-            ? 'Invalid credentials'
-            : errData.message || 'Unable to sign in right now. Please try again.',
-          'error',
-        );
+        if (response.status === 403 && errData.message) {
+          setJobseekerLoginError(errData.message);
+          if (errData.correctPortal === 'jobseeker' || errData.correctPortal === 'reclass') {
+            setJobseekerCorrectPortal(errData.correctPortal);
+          }
+        } else {
+          Swal.fire(
+            'Error',
+            errData.message ||
+              (response.status === 401
+                ? 'Invalid credentials. Please check your email/item number and password or passcode.'
+                : 'Unable to sign in right now. Please try again.'),
+            'error',
+          );
+        }
       }
     } catch (err) {
       console.error(err);
@@ -855,7 +892,7 @@ export default function Login() {
         const response = await fetch(`${API_BASE_URL}/api/applicants/forgot-password`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: fpEmail }),
+          body: JSON.stringify({ email: fpEmail, portal: portalType }),
         });
         const data = await response.json();
         if (response.ok) {
@@ -2129,9 +2166,25 @@ export default function Login() {
                 /* RECLASSIFICATION DEFAULT: ACCOUNT LOGIN */
                 <form onSubmit={handleReclassLogin} className="space-y-5">
                   {reclassLoginError && (
-                    <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center gap-2.5">
-                      <AlertCircle className="w-4 h-4 shrink-0 text-red-500" />
-                      <span className="font-medium">{reclassLoginError}</span>
+                    <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex flex-col gap-2.5">
+                      <div className="flex items-center gap-2.5">
+                        <AlertCircle className="w-4 h-4 shrink-0 text-red-500" />
+                        <span className="font-medium">{reclassLoginError}</span>
+                      </div>
+                      {reclassCorrectPortal && (
+                        <button
+                          type="button"
+                          onClick={() => handleSwitchToPortal(reclassCorrectPortal)}
+                          className="self-start ml-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#062c54] hover:bg-[#041d38] text-white font-semibold text-xs transition-colors cursor-pointer"
+                        >
+                          <span>
+                            {reclassCorrectPortal === 'jobseeker'
+                              ? 'Go to Jobseeker Portal'
+                              : 'Go to Reclassification Portal'}
+                          </span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </div>
                   )}
 
@@ -2148,6 +2201,7 @@ export default function Login() {
                         onChange={e => {
                           setReclassEmail(e.target.value);
                           setReclassLoginError(null);
+                          setReclassCorrectPortal(null);
                         }}
                         className="block w-full pl-10 sm:text-sm border-gray-300 rounded-lg border py-2.5 px-3 focus:ring-[#0369a1] focus:border-[#0369a1] outline-none transition-colors"
                         placeholder="Plantilla Item No. or name@deped.gov.ph"
@@ -2163,6 +2217,7 @@ export default function Login() {
                         onClick={() => {
                           setReclassLoginMethod('password');
                           setReclassLoginError(null);
+                          setReclassCorrectPortal(null);
                         }}
                         className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all cursor-pointer ${reclassLoginMethod === 'password'
                           ? 'bg-[#062c54] text-white shadow-xs'
@@ -2176,6 +2231,7 @@ export default function Login() {
                         onClick={() => {
                           setReclassLoginMethod('passcode');
                           setReclassLoginError(null);
+                          setReclassCorrectPortal(null);
                         }}
                         className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all cursor-pointer ${reclassLoginMethod === 'passcode'
                           ? 'bg-[#062c54] text-white shadow-xs'
@@ -2275,6 +2331,29 @@ export default function Login() {
             ) : (
               /* FORM 3: Jobseeker Login Form */
               <form onSubmit={handleJobseekerLogin} className="space-y-5">
+                {jobseekerLoginError && (
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex flex-col gap-2.5">
+                    <div className="flex items-center gap-2.5">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-red-500" />
+                      <span className="font-medium">{jobseekerLoginError}</span>
+                    </div>
+                    {jobseekerCorrectPortal && (
+                      <button
+                        type="button"
+                        onClick={() => handleSwitchToPortal(jobseekerCorrectPortal)}
+                        className="self-start ml-6 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0369a1] hover:bg-[#02527e] text-white font-semibold text-xs transition-colors cursor-pointer"
+                      >
+                        <span>
+                          {jobseekerCorrectPortal === 'reclass'
+                            ? 'Go to Reclassification Portal'
+                            : 'Go to Jobseeker Portal'}
+                        </span>
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-sm font-bold text-[#082B4C] mb-1.5">Username</label>
                   <div className="relative rounded-lg shadow-2xs">
@@ -2285,7 +2364,11 @@ export default function Login() {
                       type="text"
                       required
                       value={email}
-                      onChange={e => setEmail(e.target.value)}
+                      onChange={e => {
+                        setEmail(e.target.value);
+                        setJobseekerLoginError(null);
+                        setJobseekerCorrectPortal(null);
+                      }}
                       className="block w-full pl-10 pr-3 sm:text-sm bg-white border border-[#D1DFEC] rounded-lg py-2.5 px-3 text-[#082B4C] placeholder:text-slate-400 focus:ring-2 focus:ring-[#0A6FA6]/20 focus:border-[#0A6FA6] outline-none transition-all"
                       placeholder="Enter your username or email"
                     />
@@ -2296,7 +2379,7 @@ export default function Login() {
                   <div className="flex bg-[#EAF2F9] p-1 rounded-lg border border-[#D0E0EF]">
                     <button
                       type="button"
-                      onClick={() => { setLoginMethod('password'); setPassword(''); }}
+                      onClick={() => { setLoginMethod('password'); setPassword(''); setJobseekerLoginError(null); setJobseekerCorrectPortal(null); }}
                       className={`flex-1 text-sm font-bold py-2 rounded-md transition-all cursor-pointer ${loginMethod === 'password'
                         ? 'bg-[#062c54] text-white shadow-xs'
                         : 'text-[#082B4C] hover:text-[#062c54]'
@@ -2306,7 +2389,7 @@ export default function Login() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => { setLoginMethod('passcode'); setPassword(''); }}
+                      onClick={() => { setLoginMethod('passcode'); setPassword(''); setJobseekerLoginError(null); setJobseekerCorrectPortal(null); }}
                       className={`flex-1 text-sm font-bold py-2 rounded-md transition-all cursor-pointer ${loginMethod === 'passcode'
                         ? 'bg-[#062c54] text-white shadow-xs'
                         : 'text-[#082B4C] hover:text-[#062c54]'
@@ -2329,7 +2412,11 @@ export default function Login() {
                         required
                         maxLength={loginMethod === 'passcode' ? 6 : undefined}
                         value={password}
-                        onChange={e => setPassword(e.target.value)}
+                        onChange={e => {
+                          setPassword(e.target.value);
+                          setJobseekerLoginError(null);
+                          setJobseekerCorrectPortal(null);
+                        }}
                         className="block w-full pl-10 pr-10 sm:text-sm bg-white border border-[#D1DFEC] rounded-lg py-2.5 px-3 text-[#082B4C] placeholder:text-slate-400 focus:ring-2 focus:ring-[#0A6FA6]/20 focus:border-[#0A6FA6] outline-none transition-all"
                         placeholder={loginMethod === 'password' ? 'Enter your password' : 'Enter 6-digit passcode'}
                       />
