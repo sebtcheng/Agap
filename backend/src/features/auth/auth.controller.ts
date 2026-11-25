@@ -9,10 +9,18 @@ import {
   getAttemptKey,
   recordFailedAttempt,
 } from './auth.service';
+import {
+  INVALID_CREDENTIALS_MESSAGE,
+  validatePortalField,
+} from './auth.validation';
 
 // POST /login
 export async function login(req: Request, res: Response) {
-  const { email_address, password, loginMethod } = req.body;
+  const { email_address, password, loginMethod, portal } = req.body;
+  const portalCheck = validatePortalField(portal, 'jobseeker');
+  if (!portalCheck.ok) {
+    return res.status(400).json({ message: portalCheck.message });
+  }
   try {
     const applicant = await AuthService.login(
       email_address,
@@ -20,7 +28,7 @@ export async function login(req: Request, res: Response) {
       loginMethod,
     );
     if (!applicant) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: INVALID_CREDENTIALS_MESSAGE });
     }
     const fullName =
       [applicant.first_name, applicant.middle_name, applicant.surname]
@@ -43,6 +51,13 @@ export async function login(req: Request, res: Response) {
       },
     });
   } catch (error: any) {
+    if (error?.statusCode === 403 || error instanceof HttpError) {
+      return res.status(error.statusCode).json({
+        message: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.correctPortal ? { correctPortal: error.correctPortal } : {}),
+      });
+    }
     console.error('Error logging in:', error);
     res.status(500).json({ message: error.message || 'Error logging in' });
   }
@@ -164,8 +179,13 @@ export async function reclassRegister(req: Request, res: Response) {
 
 // POST /reclass-login
 export async function reclassLogin(req: Request, res: Response) {
-  const { email, loginMethod, password, passcode, plantilla_item_number } =
+  const { email, loginMethod, password, passcode, plantilla_item_number, portal } =
     req.body;
+
+  const portalCheck = validatePortalField(portal, 'reclass');
+  if (!portalCheck.ok) {
+    return res.status(400).json({ message: portalCheck.message });
+  }
 
   // Legacy fallback if only plantilla_item_number is sent without email
   if (!email && plantilla_item_number) {
@@ -261,7 +281,7 @@ export async function reclassLogin(req: Request, res: Response) {
             'Too many failed login attempts. Your account is temporarily locked for 15 minutes.',
         });
       }
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: INVALID_CREDENTIALS_MESSAGE });
     }
 
     clearFailedAttempts(attemptKey);
@@ -273,17 +293,28 @@ export async function reclassLogin(req: Request, res: Response) {
       data: authResult.user,
     });
   } catch (error: any) {
+    if (error?.statusCode === 403 || error instanceof HttpError) {
+      return res.status(error.statusCode).json({
+        message: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.correctPortal ? { correctPortal: error.correctPortal } : {}),
+      });
+    }
     console.error('Error in reclass-login:', error);
     recordFailedAttempt(attemptKey);
-    return res.status(401).json({ message: 'Invalid credentials' });
+    return res.status(401).json({ message: INVALID_CREDENTIALS_MESSAGE });
   }
 }
 
 // POST /forgot-password
 export async function forgotPassword(req: Request, res: Response) {
-  const { email } = req.body;
+  const { email, portal } = req.body;
   if (!email || !String(email).trim()) {
     return res.status(400).json({ message: 'Email is required' });
+  }
+  const portalCheck = validatePortalField(portal);
+  if (!portalCheck.ok) {
+    return res.status(400).json({ message: portalCheck.message });
   }
   try {
     const headerOrigin =
@@ -308,7 +339,11 @@ export async function forgotPassword(req: Request, res: Response) {
     if (!frontendBaseUrl && headerOrigin) {
       frontendBaseUrl = headerOrigin;
     }
-    const sent = await AuthService.forgotPassword(String(email).trim(), frontendBaseUrl);
+    const sent = await AuthService.forgotPassword(
+      String(email).trim(),
+      portalCheck.portal,
+      frontendBaseUrl,
+    );
     if (!sent) {
       return res.status(404).json({
         success: false,
@@ -330,14 +365,18 @@ export async function forgotPassword(req: Request, res: Response) {
 
 // POST /reset-password
 export async function resetPassword(req: Request, res: Response) {
-  const { token, new_password } = req.body;
+  const { token, new_password, portal } = req.body;
   if (!token || !new_password) {
     return res
       .status(400)
       .json({ message: 'Token and new password are required' });
   }
+  const portalCheck = validatePortalField(portal);
+  if (!portalCheck.ok) {
+    return res.status(400).json({ message: portalCheck.message });
+  }
   try {
-    await AuthService.resetPassword(token, new_password);
+    await AuthService.resetPassword(token, new_password, portalCheck.portal);
     res.json({
       success: true,
       message: 'Password has been successfully reset',

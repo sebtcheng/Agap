@@ -614,9 +614,50 @@ class ApplicantProfileServiceClass {
     return result.rows[0];
   }
 
-  async forgotPassword(email: string, frontendOrigin?: string) {
+  async forgotPassword(
+    email: string,
+    portal: 'jobseeker' | 'reclass',
+    frontendOrigin?: string,
+  ) {
     const cleanEmail = String(email || '').trim();
     if (!cleanEmail) return false;
+
+    const secret = process.env.JWT_SECRET || 'fallback_secret';
+
+    if (portal === 'reclass') {
+      const result = await pool.query(
+        `SELECT id, email AS target_email
+         FROM reclass_gc
+         WHERE LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($1))
+         ORDER BY updated_at DESC NULLS LAST, id DESC
+         LIMIT 1`,
+        [cleanEmail],
+      );
+      if (result.rows.length === 0) {
+        console.warn(
+          `⚠️ Password reset requested for unregistered email (not found in reclass_gc): ${cleanEmail}`,
+        );
+        return false;
+      }
+
+      const reclassGcId = result.rows[0].id;
+      const token = jwt.sign(
+        {
+          accountId: reclassGcId,
+          reclassGcId,
+          portal: 'reclass',
+          scope: 'password_reset',
+        },
+        secret,
+        { expiresIn: '1h' },
+      );
+
+      console.log(
+        `📧 Sending reclass password reset email to ${cleanEmail} (reclass_gc #${reclassGcId})...`,
+      );
+      await sendPasswordResetEmail(cleanEmail, token, frontendOrigin, 'reclass');
+      return true;
+    }
 
     const result = await pool.query(
       `SELECT id,
@@ -641,52 +682,75 @@ class ApplicantProfileServiceClass {
     }
 
     const applicantId = result.rows[0].id;
-    const secret = process.env.JWT_SECRET || 'fallback_secret';
-    const token = jwt.sign({ applicantId }, secret, { expiresIn: '1h' });
+    const token = jwt.sign(
+      {
+        accountId: applicantId,
+        applicantId,
+        portal: 'jobseeker',
+        scope: 'password_reset',
+      },
+      secret,
+      { expiresIn: '1h' },
+    );
 
-    console.log(`📧 Sending password reset email to ${cleanEmail} (applicant #${applicantId})...`);
-    await sendPasswordResetEmail(cleanEmail, token, frontendOrigin);
+    console.log(
+      `📧 Sending jobseeker password reset email to ${cleanEmail} (applicant #${applicantId})...`,
+    );
+    await sendPasswordResetEmail(cleanEmail, token, frontendOrigin, 'jobseeker');
     return true;
   }
 
-  async resetPassword(token: string, newPassword: string) {
+  async resetPassword(
+    token: string,
+    newPassword: string,
+    portal: 'jobseeker' | 'reclass',
+  ) {
     const secret = process.env.JWT_SECRET || 'fallback_secret';
+    let decoded: any;
     try {
-      const decoded: any = jwt.verify(token, secret);
-      if (!decoded || !decoded.applicantId) {
-        throw new Error('Invalid token structure');
-      }
-
-      const applicantId = decoded.applicantId;
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(newPassword, salt);
-
-      const result = await pool.query(
-        'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email_address, email, plantilla_item_number',
-        [passwordHash, applicantId],
-      );
-
-      if (result.rows.length === 0) {
-        throw new Error('Applicant not found');
-      }
-
-      const row = result.rows[0];
-      await pool.query(
-        `UPDATE reclass_gc SET password_hash = $1, updated_at = NOW()
-         WHERE ($2 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($2)))
-            OR ($3 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM($3)))
-            OR ($4 <> '' AND UPPER(TRIM(COALESCE(initial_reclass_psi_cd, ''))) = UPPER(TRIM($4)))`,
-        [
-          passwordHash,
-          String(row.email_address || '').trim(),
-          String(row.email || '').trim(),
-          String(row.plantilla_item_number || '').trim(),
-        ],
-      );
-      return true;
-    } catch (error) {
+      decoded = jwt.verify(token, secret);
+    } catch {
       throw new Error('Invalid or expired token');
     }
+
+    if (
+      !decoded ||
+      (decoded.portal !== 'jobseeker' && decoded.portal !== 'reclass') ||
+      decoded.portal !== portal
+    ) {
+      throw new Error('Invalid or expired token');
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(newPassword, salt);
+
+    if (portal === 'reclass') {
+      const reclassGcId = decoded.accountId ?? decoded.reclassGcId;
+      if (!reclassGcId) {
+        throw new Error('Invalid or expired token');
+      }
+      const result = await pool.query(
+        'UPDATE reclass_gc SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+        [passwordHash, reclassGcId],
+      );
+      if (result.rows.length === 0) {
+        throw new Error('Reclassification account not found');
+      }
+      return true;
+    }
+
+    const applicantId = decoded.accountId ?? decoded.applicantId;
+    if (!applicantId) {
+      throw new Error('Invalid or expired token');
+    }
+    const result = await pool.query(
+      'UPDATE applicants SET password_hash = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+      [passwordHash, applicantId],
+    );
+    if (result.rows.length === 0) {
+      throw new Error('Applicant not found');
+    }
+    return true;
   }
 
   async setPasscode(applicantId: number, passcode: string) {
