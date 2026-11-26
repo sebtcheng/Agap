@@ -1,13 +1,27 @@
 import React from 'react';
-import { FileText, Briefcase, Star, MapPin, Users, Check } from 'lucide-react';
+import { FileText, Briefcase, Star, MapPin, Users, Check, RotateCcw, Clock, XCircle, Loader2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
-const JobCard = ({ job, tab, appliedJobIds = [], savedJobIds = [], toggleSaveJob, handleApply, isPublic = false, onCardClick, onApplyClick }: any) => {
+function isExcludedApplicationStatus(job: any): boolean {
+  const raw = job?.applicationDbStatus ?? job?.rawStatus ?? (job?.status !== 'Active' ? job?.status : '');
+  return String(raw || '').trim().toLowerCase() === 'excluded';
+}
+
+function getReapplicationStatus(job: any): '' | 'PENDING' | 'ACCEPTED' | 'REJECTED' {
+  const norm = String(job?.reapplicationStatus ?? job?.reapplication_status ?? '').trim().toUpperCase();
+  if (norm === 'PENDING' || norm === 'ACCEPTED' || norm === 'REJECTED') return norm;
+  return '';
+}
+
+const JobCard = ({ job, tab, appliedJobIds = [], savedJobIds = [], toggleSaveJob, handleApply, handleReapply, reapplyingAppId = null, isPublic = false, onCardClick, onApplyClick }: any) => {
   const navigate = useNavigate();
   const isApplied = appliedJobIds.includes(job.id || job.positionId);
   const isSaved = savedJobIds.includes(job.id || job.positionId);
   const isInvited = Boolean(job.is_invited || job.isInvited || job.has_allowed_email_access);
   const title = job.title || job.position || 'Unknown Position';
+  const isExcluded = isExcludedApplicationStatus(job);
+  const reappStatus = getReapplicationStatus(job);
+  const isSubmittingReapply = Boolean(reapplyingAppId && reapplyingAppId === job.id);
 
   const containerClass = isInvited
     ? 'relative overflow-hidden rounded-[26px] border-[1.5px] border-[#FDE68A] bg-[#FFFDF9] p-6 sm:p-7 flex flex-col shadow-[0_4px_25px_rgba(245,158,11,0.12)] transition-all'
@@ -103,6 +117,42 @@ const JobCard = ({ job, tab, appliedJobIds = [], savedJobIds = [], toggleSaveJob
                 {job.assessmentStatus || 'N/A'}
               </div>
             </div>
+            {isExcluded && (
+              <div className="mt-2 flex flex-col items-center justify-center gap-2 w-full">
+                {reappStatus === 'PENDING' ? (
+                  <span className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-[12px] font-bold bg-amber-50 text-amber-800 border border-amber-200 uppercase tracking-wide shadow-xs">
+                    <Clock className="w-3.5 h-3.5" /> Reapplication Pending
+                  </span>
+                ) : (
+                  <>
+                    {reappStatus === 'REJECTED' && (
+                      <span className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-[12px] font-bold bg-red-50 text-red-700 border border-red-200 uppercase tracking-wide shadow-xs">
+                        <XCircle className="w-3.5 h-3.5" /> Reapplication Rejected
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      disabled={isSubmittingReapply}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleReapply?.(job);
+                      }}
+                      className="w-full bg-[#002855] hover:bg-[#001c3d] disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-2.5 px-4 rounded-xl text-[12.5px] tracking-wide transition-colors flex justify-center items-center gap-2 shadow-sm"
+                    >
+                      {isSubmittingReapply ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" /> Submitting Reapplication...
+                        </>
+                      ) : (
+                        <>
+                          <RotateCcw className="w-4 h-4" /> Submit Reapplication
+                        </>
+                      )}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -128,7 +178,7 @@ const JobCard = ({ job, tab, appliedJobIds = [], savedJobIds = [], toggleSaveJob
   );
 };
 
-const JobTableList = ({ jobs, tab, appliedJobIds = [], savedJobIds = [], toggleSaveJob, handleApply, isPublic = false, onCardClick, onApplyClick }: any) => {
+const JobTableList = ({ jobs, tab, appliedJobIds = [], savedJobIds = [], toggleSaveJob, handleApply, handleReapply, reapplyingAppId = null, isPublic = false, onCardClick, onApplyClick }: any) => {
   const navigate = useNavigate();
   const borderColor = tab === 'my-applications' ? 'border-[#2563eb]' : 'border-[#fbbf24]';
   const shadowClass = tab === 'my-applications' 
@@ -162,6 +212,9 @@ const JobTableList = ({ jobs, tab, appliedJobIds = [], savedJobIds = [], toggleS
               const isSaved = savedJobIds.includes(job.id || job.positionId);
               const isInvited = Boolean(job.is_invited || job.isInvited || job.has_allowed_email_access);
               const title = job.title || job.position || 'Unknown Position';
+              const isExcluded = isExcludedApplicationStatus(job);
+              const reappStatus = getReapplicationStatus(job);
+              const isSubmittingReapply = Boolean(reapplyingAppId && reapplyingAppId === job.id);
 
               const rowClass = isInvited
                 ? 'bg-[#fffdf9] hover:bg-amber-50/50 transition-colors group border-l-[5px] border-l-[#f59e0b]'
@@ -227,8 +280,38 @@ const JobTableList = ({ jobs, tab, appliedJobIds = [], savedJobIds = [], toggleS
 
                   {/* Actions Column */}
                   <td className="px-6 py-5 align-top">
-                    <div className="flex flex-col gap-2 min-w-[120px]">
-                      {(isApplied || tab === 'my-applications') ? (
+                    <div className="flex flex-col gap-2 min-w-[140px]">
+                      {tab === 'my-applications' && isExcluded ? (
+                        reappStatus === 'PENDING' ? (
+                          <span className="w-full inline-flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg text-[11px] font-bold bg-amber-50 text-amber-800 border border-amber-200 uppercase tracking-wide whitespace-nowrap">
+                            <Clock className="w-3 h-3" /> Reapplication Pending
+                          </span>
+                        ) : (
+                          <>
+                            {reappStatus === 'REJECTED' && (
+                              <span className="w-full inline-flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg text-[11px] font-bold bg-red-50 text-red-700 border border-red-200 uppercase tracking-wide whitespace-nowrap">
+                                <XCircle className="w-3 h-3" /> Reapplication Rejected
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              disabled={isSubmittingReapply}
+                              onClick={() => handleReapply?.(job)}
+                              className="w-full bg-[#002855] hover:bg-[#001c3d] disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-2 px-2.5 rounded-lg text-[11px] tracking-wide transition-colors flex justify-center items-center gap-1.5 shadow-sm whitespace-nowrap"
+                            >
+                              {isSubmittingReapply ? (
+                                <>
+                                  <Loader2 className="w-3 h-3 animate-spin" /> Submitting...
+                                </>
+                              ) : (
+                                <>
+                                  <RotateCcw className="w-3 h-3" /> Submit Reapplication
+                                </>
+                              )}
+                            </button>
+                          </>
+                        )
+                      ) : (isApplied || tab === 'my-applications') ? (
                         <button disabled className="w-full bg-gray-100 text-gray-500 font-bold py-2 rounded-lg text-[11px] tracking-wide cursor-not-allowed flex justify-center items-center gap-1.5 border border-gray-200">
                           <Check className="w-3 h-3" strokeWidth={4} /> APPLIED
                         </button>

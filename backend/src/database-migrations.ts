@@ -384,6 +384,30 @@ export async function runSchemaMigrations(client: any) {
 
       CREATE INDEX IF NOT EXISTS idx_reclass_sg_salary_grade 
       ON reclass_sg (salary_grade);
+
+      -- Ensure reapplication tracking columns & indices exist on applications
+      ALTER TABLE applications ADD COLUMN IF NOT EXISTS reapplication_status VARCHAR(20);
+      ALTER TABLE applications ADD COLUMN IF NOT EXISTS reapplied_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE applications ADD COLUMN IF NOT EXISTS reapplication_reviewed_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE applications ADD COLUMN IF NOT EXISTS reapplication_reviewed_by TEXT;
+
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'chk_applications_reapplication_status'
+        ) THEN
+          ALTER TABLE applications
+            ADD CONSTRAINT chk_applications_reapplication_status
+            CHECK (reapplication_status IS NULL OR reapplication_status IN ('PENDING', 'ACCEPTED', 'REJECTED'));
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS idx_applications_reapplication_status
+      ON applications (reapplication_status)
+      WHERE reapplication_status IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_applications_status_reapplication
+      ON applications (LOWER(TRIM(COALESCE(status, ''))), reapplication_status);
     `);
 
     console.log('✅ Schema check: columns and tables verified.');

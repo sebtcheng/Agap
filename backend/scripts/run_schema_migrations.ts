@@ -33,7 +33,10 @@ async function main() {
     await client.query('SET statement_timeout = 0');
     await runSchemaMigrations(client);
     // Idempotent SQL migrations that are safe in a single implicit transaction.
-    for (const file of ['index_cleanup_migration.sql']) {
+    for (const file of [
+      'index_cleanup_migration.sql',
+      'add_reapplication_columns_migration.sql',
+    ]) {
       await client.query(
         readFileSync(join(__dirname, '..', 'database', 'migrations', file), 'utf8'),
       );
