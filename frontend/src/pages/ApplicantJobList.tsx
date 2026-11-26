@@ -48,6 +48,64 @@ export default function ApplicantJobList() {
   const [highlightDocs, setHighlightDocs] = useState(false);
   const [isProfileLoaded, setIsProfileLoaded] = useState(false);
   const [pendingApplyJob, setPendingApplyJob] = useState<any>(null);
+  const [reapplyingAppId, setReapplyingAppId] = useState<string | null>(null);
+
+  const handleReapply = async (app: any) => {
+    const sessionStr = localStorage.getItem('session_data');
+    if (!sessionStr) {
+      navigate('/login');
+      return;
+    }
+    const session = JSON.parse(sessionStr);
+    const confirmResult = await Swal.fire({
+      title: 'Submit Reapplication?',
+      text: `Submit a reapplication for ${app.position || app.title || 'this position'}? Reviewers will evaluate your latest profile and documents.`,
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: '#002855',
+      confirmButtonText: 'Submit Reapplication',
+      cancelButtonText: 'Cancel',
+    });
+    if (!confirmResult.isConfirmed) return;
+
+    setReapplyingAppId(app.id);
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_API_URL || ''}/api/applications/${encodeURIComponent(app.id)}/reapply`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ applicantId: session.id }),
+        },
+      );
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'Failed to submit reapplication.');
+      }
+      setApplications((prev) =>
+        prev.map((item) =>
+          item.id === app.id
+            ? { ...item, reapplicationStatus: 'PENDING' }
+            : item,
+        ),
+      );
+      Swal.fire({
+        icon: 'success',
+        title: 'Reapplication Submitted',
+        text: 'Your reapplication request is now pending review.',
+        timer: 2500,
+        showConfirmButton: false,
+      });
+    } catch (err: any) {
+      Swal.fire({
+        icon: 'error',
+        title: 'Reapplication Failed',
+        text: err?.message || 'Unable to submit reapplication.',
+      });
+    } finally {
+      setReapplyingAppId(null);
+    }
+  };
 
   const [availableRegions, setAvailableRegions] = useState<string[]>([]);
   const [availableDivisions, setAvailableDivisions] = useState<string[]>([]);
@@ -921,6 +979,8 @@ export default function ApplicantJobList() {
                     itemNo: app.item_no || jobDetails.itemNo || 'N/A',
                     date: new Date(app.created_at).toLocaleDateString(),
                     stage: app.application_status || app.status || 'Applied',
+                    applicationDbStatus: app.status || null,
+                    reapplicationStatus: app.reapplication_status || null,
                     assessmentStatus: app.assessment_status || 'Pending Assessment',
                     appointmentStatus: app.appointment_status || 'Pending Appointment',
                     comparativeAssessmentScores: app.comparative_assessment_scores || '',
@@ -1808,6 +1868,8 @@ export default function ApplicantJobList() {
                     savedJobIds={savedJobIds}
                     toggleSaveJob={toggleSaveJob}
                     handleApply={handleApply}
+                    handleReapply={handleReapply}
+                    reapplyingAppId={reapplyingAppId}
                   />
                 ) : (
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -1820,6 +1882,8 @@ export default function ApplicantJobList() {
                         savedJobIds={savedJobIds}
                         toggleSaveJob={toggleSaveJob}
                         handleApply={handleApply}
+                        handleReapply={handleReapply}
+                        reapplyingAppId={reapplyingAppId}
                       />
                     ))}
                   </div>

@@ -1,5 +1,7 @@
+import { randomUUID } from 'crypto';
 import { pool } from '../../database';
 import { DocumentsService } from '../documents/documents.service';
+import { isExcludedApplicationStatus } from './applications.validation';
 
 /**
  * Application-readiness validation for POST /api/applicants/apply-job.
@@ -356,10 +358,85 @@ class ApplicationsServiceClass {
     return result.rows.map((r) => ({
       ...r,
       position_id: r.job_cluster_id,
+      status: r.status,
       application_status: r.application_status || r.status,
+      reapplication_status: r.reapplication_status || null,
+      reapplied_at: r.reapplied_at || null,
+      reapplication_reviewed_at: r.reapplication_reviewed_at || null,
       is_invited: Boolean(r.is_invited),
       isInvited: Boolean(r.is_invited),
     }));
+  }
+
+  async submitReapplication(applicationId: string, applicantId: number) {
+    const existingRes = await pool.query(
+      `SELECT id, applicant_id, status, application_status, reapplication_status
+       FROM applications
+       WHERE id = $1`,
+      [applicationId],
+    );
+
+    const existing = existingRes.rows[0];
+    if (!existing) {
+      const err: any = new Error('Application not found.');
+      err.status = 404;
+      throw err;
+    }
+
+    if (String(existing.applicant_id) !== String(applicantId)) {
+      const err: any = new Error(
+        'You are not authorized to submit a reapplication for this application.',
+      );
+      err.status = 403;
+      throw err;
+    }
+
+    if (!isExcludedApplicationStatus(existing.status)) {
+      const err: any = new Error(
+        'Reapplication is only allowed when application status is Excluded.',
+      );
+      err.status = 400;
+      throw err;
+    }
+
+    const currentReappStatus = String(existing.reapplication_status || '')
+      .trim()
+      .toUpperCase();
+    if (currentReappStatus === 'PENDING') {
+      const err: any = new Error(
+        'A reapplication has already been submitted and is pending review.',
+      );
+      err.status = 409;
+      throw err;
+    }
+
+    const updatedRes = await pool.query(
+      `UPDATE applications
+       SET reapplication_status = 'PENDING',
+           reapplied_at = NOW(),
+           reapplication_reviewed_at = NULL,
+           reapplication_reviewed_by = NULL,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [applicationId],
+    );
+
+    try {
+      await pool.query(
+        `INSERT INTO application_history (id, application_id, text)
+         VALUES ($1, $2, $3)`,
+        [
+          randomUUID(),
+          applicationId,
+          'Applicant submitted a reapplication request.',
+        ],
+      );
+    } catch {
+      // Non-fatal history log
+    }
+
+    return updatedRes.rows[0];
   }
 
   async toggleSavedJob(applicantId: number, jobClusterId: string) {

@@ -9,7 +9,9 @@ import healthRouter from './health/health.routes';
 import applicantsRouter from './applicants/applicants.routes';
 import { applicantAuthRouter, hrAuthRouter } from './features/auth/auth.routes';
 import profileRouter from './features/applicant-profile/applicant-profile.routes';
-import applicationsRouter from './features/applications/applications.routes';
+import applicationsRouter, {
+  reapplyRouter,
+} from './features/applications/applications.routes';
 import documentsRouter from './features/documents/documents.routes';
 import pdsRouter from './features/pds/pds.routes';
 import reclassRouter from './features/reclass/reclass.routes';
@@ -42,6 +44,9 @@ app.use('/api', hrAuthRouter);
 
 // Vacancies Module Routes
 app.use('/api/vacancies', vacanciesRouter);
+
+// Applications Reapplication Route
+app.use('/api/applications', reapplyRouter);
 
 // Applicants Module Routes (auth + reclass routers first: they own specific paths
 // that applicants' '/:id' routes would otherwise shadow)
